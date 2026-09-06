@@ -19,6 +19,7 @@ pub mod lkg;
 pub mod logs;
 pub mod metrics;
 pub mod payload_dek;
+pub mod status;
 
 pub use agent::{AgentEvent, AgentRunner, AgentRunnerConfig, AgentShutdown, ConfigApplier};
 pub use client::AgentClient;
@@ -27,6 +28,7 @@ pub use lkg::{LkgCache, LkgEntry};
 pub use logs::{LogBuffer, LogLevel, LogLineSample};
 pub use metrics::{MetricsBuffer, SampleOutcome, ToolCallSample};
 pub use payload_dek::{DekError, DekHandle};
+pub use status::{ClusterStatusSample, PluginStatusSample, StatusSnapshot, StatusSource};
 
 /// Re-exported so gateway / consumers can refer to the
 /// CP's QuotaStatus type without depending on

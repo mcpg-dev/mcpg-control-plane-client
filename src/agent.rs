@@ -196,6 +196,15 @@ pub struct AgentRunner {
     /// Host hook to apply a pushed config bundle (gateway hot-reload). `None`
     /// → cache-only (legacy). See [`ConfigApplier`].
     config_applier: Option<Arc<dyn ConfigApplier>>,
+    /// Host hook that snapshots the process for the periodic
+    /// `StatusReport`. `None` → no reports (legacy behaviour for
+    /// non-gateway agents). See [`crate::status::StatusSource`].
+    status_source: Option<Arc<dyn crate::status::StatusSource>>,
+    /// Hash of the last config bundle this process runs — the LKG
+    /// preload at boot, then every successfully-applied ConfigUpdate.
+    /// Stamped as `config_hash` on each `StatusReport` so the CP sees
+    /// what is actually in effect, not what it last pushed.
+    applied_config_hash: Arc<ArcSwap<Option<String>>>,
 }
 
 impl AgentRunner {
@@ -215,6 +224,8 @@ impl AgentRunner {
             quota_status: Arc::new(ArcSwap::from_pointee(None)),
             payload_dek: Arc::new(ArcSwap::from_pointee(None)),
             config_applier: None,
+            status_source: None,
+            applied_config_hash: Arc::new(ArcSwap::from_pointee(None)),
         }
     }
 
@@ -223,6 +234,14 @@ impl AgentRunner {
     /// applied (legacy behaviour).
     pub fn with_config_applier(mut self, applier: Arc<dyn ConfigApplier>) -> Self {
         self.config_applier = Some(applier);
+        self
+    }
+
+    /// Wire a host hook that snapshots the process for the periodic
+    /// `StatusReport` (plugin table, warnings, clustering health on the
+    /// console's gateway pages). Without it the agent sends none.
+    pub fn with_status_source(mut self, source: Arc<dyn crate::status::StatusSource>) -> Self {
+        self.status_source = Some(source);
         self
     }
 
@@ -338,6 +357,7 @@ impl AgentRunner {
         let lkg = LkgCache::in_state_dir(&self.cfg.state_dir);
         if let Ok(Some((hash, _))) = lkg.load_bundle() {
             info!(%hash, "agent: preloaded LKG config");
+            self.applied_config_hash.store(Arc::new(Some(hash.clone())));
             let _ = self.events.send(AgentEvent::ConfigReceived { hash });
         }
 
@@ -441,6 +461,25 @@ impl AgentRunner {
             logs_flush_loop(logs_buf, logs_tx, DEFAULT_LOG_FLUSH_INTERVAL).await;
         });
 
+        // Status ticker — snapshots the host on every tick (first one
+        // immediate, so the console's status card fills right after
+        // attach) and ships a `StatusReport`. Only when the host wired
+        // a source.
+        let status_handle = self.status_source.as_ref().map(|source| {
+            let source = source.clone();
+            let hash = self.applied_config_hash.clone();
+            let status_tx = out_tx.clone();
+            tokio::spawn(async move {
+                crate::status::status_loop(
+                    source,
+                    hash,
+                    status_tx,
+                    crate::status::DEFAULT_STATUS_INTERVAL,
+                )
+                .await;
+            })
+        });
+
         // Read inbound ServerMessages until the stream ends or shutdown is
         // asked for.
         let inbound_result = tokio::select! {
@@ -451,6 +490,9 @@ impl AgentRunner {
         hb_handle.abort();
         metrics_handle.abort();
         logs_handle.abort();
+        if let Some(h) = status_handle {
+            h.abort();
+        }
         // The abort above returns any in-flight batch to its buffer, so this
         // ships everything still owed — including whatever accumulated since
         // the last tick. Only on a requested shutdown: a session that died is
@@ -536,6 +578,9 @@ impl AgentRunner {
                         },
                         _ => ("active".to_string(), String::new()),
                     };
+                    if applied_state == "active" && !hash.is_empty() {
+                        self.applied_config_hash.store(Arc::new(Some(hash.clone())));
+                    }
 
                     let _ = self
                         .events
