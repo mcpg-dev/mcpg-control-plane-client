@@ -53,6 +53,9 @@ pub struct StatusSnapshot {
     pub plugins: Vec<PluginStatusSample>,
     pub warnings: Vec<String>,
     pub cluster: Option<ClusterStatusSample>,
+    /// Digest of the `${secret.*}` values the running config resolved with
+    /// (sha256 over sorted `NAME=VALUE\n`, hex); empty when none.
+    pub secrets_digest: String,
 }
 
 /// Host hook that snapshots the running process for the periodic
@@ -91,6 +94,7 @@ pub(crate) fn snapshot_to_message(snap: StatusSnapshot, config_hash: String) -> 
                 backend_up: c.backend_up,
                 peers: c.peers,
             }),
+            secrets_digest: snap.secrets_digest,
         })),
     }
 }
@@ -138,6 +142,7 @@ mod tests {
                 backend_up: Some(true),
                 peers: Some(3),
             }),
+            secrets_digest: String::new(),
         };
         let msg = snapshot_to_message(snap, "hash-1".into());
         let Some(AgentKind::StatusReport(r)) = msg.kind else {
@@ -161,6 +166,7 @@ mod tests {
                 backend_up: None,
                 peers: None,
             }),
+            secrets_digest: String::new(),
         };
         let msg = snapshot_to_message(snap, String::new());
         let Some(AgentKind::StatusReport(r)) = msg.kind else {
