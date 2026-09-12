@@ -65,6 +65,11 @@ impl AgentClient {
         *self.jwt.write().await = Some(token);
     }
 
+    /// The instance JWT currently presented on authenticated calls.
+    pub async fn current_jwt(&self) -> Option<String> {
+        self.jwt.read().await.clone()
+    }
+
     /// Lazy-connect; reused thereafter.
     pub async fn connect(&self) -> anyhow::Result<()> {
         let mut g = self.channel.write().await;

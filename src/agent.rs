@@ -24,7 +24,7 @@ use mcpg_control_plane_core::proto::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::backoff::Backoff;
 use crate::client::{AgentClient, ClientTlsMaterial};
@@ -328,28 +328,14 @@ impl AgentRunner {
                 }))
                 .await;
         }
-        let creds = self.ensure_registered().await?;
-        self.client.set_jwt(creds.instance_jwt.clone()).await;
-        // Hydrate the payload DEK handle from creds — either
-        // freshly issued at Register or restored from disk on
-        // restart. Empty fields → `None`, gateway falls through
-        // to plaintext capture (legacy CP-side encrypt at ingest).
-        self.install_payload_dek_from_creds(&creds);
-        // Apply any stored mTLS material so the next connect uses
-        // it. No-op when the endpoint scheme is plain http. We
-        // also reset the cached channel so subsequent calls
-        // negotiate a fresh TLS handshake with the new client
-        // cert (Register may have run TLS-only or plaintext).
-        if !creds.client_cert_pem.is_empty() && !creds.ca_chain_pem.is_empty() {
-            self.client
-                .set_tls(Some(ClientTlsMaterial {
-                    ca_pem: creds.ca_chain_pem.clone(),
-                    client_cert_pem: creds.client_cert_pem.clone(),
-                    client_key_pem: creds.client_key_pem.clone(),
-                    server_name: None,
-                }))
-                .await;
-            self.client.reset().await;
+        match self.cached_creds() {
+            Some(creds) => {
+                info!(instance_id = %creds.instance_id, "agent: using cached creds");
+                self.install_creds(&creds).await;
+            }
+            None => {
+                self.register_fresh().await?;
+            }
         }
 
         // Best-effort: preload the last-known-good config so the
@@ -361,14 +347,15 @@ impl AgentRunner {
             let _ = self.events.send(AgentEvent::ConfigReceived { hash });
         }
 
-        self.run_loop(Arc::new(creds)).await
+        self.run_loop().await
     }
 
     /// Run the heartbeat + channel loop. Reconnects with backoff
     /// on failure. Returns only when the underlying error is
     /// non-recoverable.
-    async fn run_loop(&self, creds: Arc<StoredCreds>) -> anyhow::Result<()> {
+    async fn run_loop(&self) -> anyhow::Result<()> {
         let mut backoff = Backoff::new(self.cfg.backoff_initial, self.cfg.backoff_max, true);
+        let refresh_window = token_refresh_window(self.cfg.heartbeat_interval);
 
         loop {
             if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
@@ -378,10 +365,59 @@ impl AgentRunner {
                 self.shutdown_done.notify_waiters();
                 return Ok(());
             }
-            match self.run_session(creds.clone()).await {
+            // A token the CP would refuse (or is about to) is replaced before
+            // the connect, so an agent that missed its rotation pushes never
+            // presents it. The normal case stays the CredentialRotation push.
+            let now = chrono::Utc::now().timestamp();
+            let exp = match self.client.current_jwt().await {
+                Some(jwt) => jwt_exp(&jwt),
+                None => None,
+            };
+            if expires_within(exp, now, refresh_window) {
+                match extract_token(&self.cfg.enrollment_url) {
+                    Ok(_) => {
+                        info!(
+                            ?exp,
+                            "agent: instance token expired or about to; re-enrolling before connecting"
+                        );
+                        self.register_fresh().await?;
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        "agent: instance token expired or about to, but no enrollment_url to re-enrol with"
+                    ),
+                }
+            }
+            match self.run_session().await {
                 Ok(()) => {
                     backoff.reset();
                     info!("agent: session ended cleanly");
+                }
+                Err(e) if is_credential_rejection(&e) => {
+                    let delay = backoff.next_delay();
+                    warn!(
+                        error = %e,
+                        ?delay,
+                        "agent: CP rejected the instance credentials; re-enrolling"
+                    );
+                    let _ = self.events.send(AgentEvent::ChannelDisconnected {
+                        reason: e.to_string(),
+                    });
+                    self.client.reset().await;
+                    // The rejected creds are discarded only once something can
+                    // replace them; without an enrollment token they stay on
+                    // disk and the loop keeps retrying them at backoff cadence.
+                    if let Err(e) = extract_token(&self.cfg.enrollment_url) {
+                        error!(
+                            error = %e,
+                            "agent: cannot re-enrol after credential rejection; set control_plane.enrollment_url"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    discard_stored_creds(&self.cfg.state_dir);
+                    tokio::time::sleep(delay).await;
+                    self.register_fresh().await?;
                 }
                 Err(e) => {
                     let delay = backoff.next_delay();
@@ -398,7 +434,7 @@ impl AgentRunner {
 
     /// One Channel session: connect → spawn heartbeat ticker →
     /// receive ServerMessages → exit on stream error.
-    async fn run_session(&self, _creds: Arc<StoredCreds>) -> anyhow::Result<()> {
+    async fn run_session(&self) -> anyhow::Result<()> {
         // Open the bidirectional Channel.
         let (out_tx, out_rx) = mpsc::channel::<AgentMessage>(64);
         let outbound = tokio_stream::wrappers::ReceiverStream::new(out_rx);
@@ -686,18 +722,40 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// Read cached creds if present; else perform a fresh
-    /// Register exchange.
-    async fn ensure_registered(&self) -> anyhow::Result<StoredCreds> {
-        let creds_path = self.cfg.state_dir.join("agent-creds.json");
-        if let Ok(bytes) = std::fs::read(&creds_path)
-            && let Ok(creds) = serde_json::from_slice::<StoredCreds>(&bytes)
-        {
-            // exp is not validated here; the server rejects an expired JWT.
-            info!(instance_id = %creds.instance_id, "agent: using cached creds");
-            return Ok(creds);
-        }
+    /// The creds persisted by an earlier Register or rotation, if readable.
+    /// The token's `exp` is checked by the run loop before every connect.
+    fn cached_creds(&self) -> Option<StoredCreds> {
+        read_stored_creds(&self.cfg.state_dir).ok()
+    }
 
+    /// Make `creds` the ones the client presents: JWT, payload DEK, and the
+    /// mTLS material (with a channel reset so the next connect handshakes
+    /// with the new client cert).
+    async fn install_creds(&self, creds: &StoredCreds) {
+        self.client.set_jwt(creds.instance_jwt.clone()).await;
+        // Empty DEK fields → `None`, gateway falls through to plaintext
+        // capture (legacy CP-side encrypt at ingest).
+        self.install_payload_dek_from_creds(creds);
+        // No-op when the endpoint scheme is plain http.
+        if !creds.client_cert_pem.is_empty() && !creds.ca_chain_pem.is_empty() {
+            self.client
+                .set_tls(Some(ClientTlsMaterial {
+                    ca_pem: creds.ca_chain_pem.clone(),
+                    client_cert_pem: creds.client_cert_pem.clone(),
+                    client_key_pem: creds.client_key_pem.clone(),
+                    server_name: None,
+                }))
+                .await;
+            self.client.reset().await;
+        }
+    }
+
+    /// Perform the Register exchange with the enrollment token, persist the
+    /// issued creds, and install them on the client. Retries the RPC with
+    /// backoff until the CP answers; fails only when there is no enrollment
+    /// token to present.
+    async fn register_fresh(&self) -> anyhow::Result<StoredCreds> {
+        let creds_path = self.cfg.state_dir.join("agent-creds.json");
         let token = extract_token(&self.cfg.enrollment_url)?;
         let req = RegisterRequest {
             bootstrap_token: token,
@@ -714,13 +772,10 @@ impl AgentRunner {
             }),
         };
 
-        // Retry the INITIAL Register with backoff. A transient CP outage at pod
-        // boot (the CP rolling, a network blip, the gRPC advertise endpoint not
-        // yet routable) must not permanently wedge enrollment — the old one-shot
-        // `?` returned the first error and the agent task exited, so the gateway
-        // served its file config forever but never received CP config / quota /
-        // credential rotation. Runs in the agent's own task, so the gateway's
-        // HTTP server keeps serving while this retries in the background.
+        // A transient CP outage (the CP rolling, a network blip, the gRPC
+        // advertise endpoint not yet routable) must not wedge enrollment. This
+        // runs in the agent's own task, so the gateway's HTTP server keeps
+        // serving while it retries in the background.
         let client = self.client.clone();
         let resp = retry_with_backoff(self.cfg.backoff_initial, self.cfg.backoff_max, move || {
             let client = client.clone();
@@ -756,6 +811,7 @@ impl AgentRunner {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&creds_path, std::fs::Permissions::from_mode(0o600));
         }
+        self.install_creds(&creds).await;
         Ok(creds)
     }
 }
@@ -795,6 +851,69 @@ impl AgentRunner {
 fn read_stored_creds(state_dir: &std::path::Path) -> anyhow::Result<StoredCreds> {
     let bytes = std::fs::read(state_dir.join("agent-creds.json"))?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Remove the persisted creds so a restart re-enrols instead of presenting a
+/// token the CP has already refused. Best-effort.
+fn discard_stored_creds(state_dir: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(state_dir.join("agent-creds.json"))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(error = ?e, "agent: could not remove rejected creds file");
+    }
+}
+
+/// Floor on how much validity a token must have left before a connect.
+const MIN_TOKEN_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// A token due to expire within this window is replaced before it is
+/// presented: enough heartbeats to notice a rotation push that never came.
+fn token_refresh_window(heartbeat_interval: Duration) -> Duration {
+    MIN_TOKEN_REFRESH_WINDOW.max(heartbeat_interval.saturating_mul(3))
+}
+
+/// The `exp` claim of a JWT, read from the payload without checking the
+/// signature — the CP verifies; this only decides whether to bother it.
+fn jwt_exp(jwt: &str) -> Option<i64> {
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let exp = claims.get("exp")?;
+    exp.as_i64().or_else(|| exp.as_f64().map(|f| f as i64))
+}
+
+/// Whether a token with this `exp` must be replaced before use. An
+/// unreadable `exp` counts as expired: a token this client cannot read is
+/// not one to build a session on.
+fn expires_within(exp: Option<i64>, now: i64, window: Duration) -> bool {
+    match exp {
+        Some(exp) => exp.saturating_sub(now) <= window.as_secs() as i64,
+        None => true,
+    }
+}
+
+/// Whether a session error is the CP refusing the presented instance
+/// credentials, as opposed to a transport blip or a stream that ended. That
+/// is a `tonic::Status` anywhere in the chain with code `Unauthenticated`
+/// (the auth interceptor's verdict on the `mcpg-instance-token` header), or
+/// `PermissionDenied` whose message names the instance token.
+fn is_credential_rejection(err: &anyhow::Error) -> bool {
+    let Some(status) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+    else {
+        return false;
+    };
+    match status.code() {
+        tonic::Code::Unauthenticated => true,
+        tonic::Code::PermissionDenied => {
+            let message = status.message().to_ascii_lowercase();
+            message.contains("instance-token") || message.contains("instance token")
+        }
+        _ => false,
+    }
 }
 
 /// Replace the `instance_jwt` field of the persisted creds file
@@ -838,14 +957,13 @@ fn persist_rotated_creds(
 
 /// Retry `op` with exponential backoff until it succeeds, returning its value.
 ///
-/// Used for the INITIAL Register so a transient CP outage at pod boot doesn't
-/// permanently wedge enrollment. There is no max-attempts cap on purpose: a
-/// gateway that can't reach its CP has nothing better to do than keep trying,
-/// and the caller's task is aborted on shutdown — which cancels the `sleep`
-/// await — so this never needs an explicit cancellation token. A genuinely
-/// permanent failure (e.g. a bad bootstrap token) retries too, but that is no
-/// worse than the old one-shot behaviour (which also never enrolled) and
-/// self-heals if the cause clears.
+/// Used for the Register exchange (first enrolment and re-enrolment) so a
+/// transient CP outage doesn't wedge the agent. There is no max-attempts cap
+/// on purpose: a gateway that can't reach its CP has nothing better to do than
+/// keep trying, and the caller's task is aborted on shutdown — which cancels
+/// the `sleep` await — so this never needs an explicit cancellation token. A
+/// genuinely permanent failure (e.g. a bad bootstrap token) retries too, which
+/// enrols no worse than giving up would and self-heals if the cause clears.
 async fn retry_with_backoff<T, F, Fut>(initial: Duration, max: Duration, mut op: F) -> T
 where
     F: FnMut() -> Fut,
@@ -858,13 +976,13 @@ where
         match op().await {
             Ok(v) => {
                 if attempt > 1 {
-                    info!(attempt, "agent: initial Register succeeded after retries");
+                    info!(attempt, "agent: Register succeeded after retries");
                 }
                 return v;
             }
             Err(e) => {
                 let delay = backoff.next_delay();
-                warn!(error = ?e, attempt, ?delay, "agent: initial Register failed; retrying after backoff");
+                warn!(error = ?e, attempt, ?delay, "agent: Register failed; retrying after backoff");
                 tokio::time::sleep(delay).await;
             }
         }
@@ -1008,6 +1126,391 @@ mod tests {
         assert_eq!(
             err.apply(&ConfigBundle::default()).await.unwrap_err(),
             "apply rejected"
+        );
+    }
+
+    /// An unsigned JWT-shaped string with the given payload JSON.
+    fn jwt_with_payload(payload: &str) -> String {
+        let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes());
+        format!(
+            "{}.{}.sig",
+            b64(r#"{"alg":"EdDSA","typ":"JWT"}"#),
+            b64(payload)
+        )
+    }
+
+    #[test]
+    fn jwt_exp_reads_the_payload_claim() {
+        assert_eq!(
+            jwt_exp(&jwt_with_payload(
+                r#"{"sub":"instance:x","exp":1700000000}"#
+            )),
+            Some(1_700_000_000)
+        );
+        // Padded base64url (some encoders keep the `=`) decodes too.
+        let padded = format!(
+            "{}==",
+            jwt_with_payload(r#"{"exp":42}"#)
+                .rsplit_once('.')
+                .unwrap()
+                .0
+        );
+        assert_eq!(jwt_exp(&format!("{padded}.sig")), Some(42));
+        // A float `exp` is still a deadline.
+        assert_eq!(jwt_exp(&jwt_with_payload(r#"{"exp":42.0}"#)), Some(42));
+    }
+
+    #[test]
+    fn jwt_exp_is_none_for_malformed_or_missing() {
+        assert_eq!(jwt_exp(""), None, "empty");
+        assert_eq!(jwt_exp("not-a-jwt"), None, "no dots");
+        assert_eq!(jwt_exp("a.!!!.c"), None, "payload is not base64url");
+        assert_eq!(jwt_exp("a.bm90IGpzb24.c"), None, "payload is not JSON");
+        assert_eq!(
+            jwt_exp(&jwt_with_payload(r#"{"sub":"instance:x"}"#)),
+            None,
+            "no exp claim"
+        );
+        assert_eq!(
+            jwt_exp(&jwt_with_payload(r#"{"exp":"soon"}"#)),
+            None,
+            "exp is not a number"
+        );
+    }
+
+    /// Whatever cannot be read is treated as "refresh now" — the loop never
+    /// builds a session on a token it cannot vouch for.
+    #[test]
+    fn expires_within_treats_unreadable_as_expired() {
+        let window = Duration::from_secs(300);
+        assert!(expires_within(None, 1_000, window));
+        assert!(expires_within(Some(900), 1_000, window), "already past");
+        assert!(expires_within(Some(1_000), 1_000, window), "expiring now");
+        assert!(
+            expires_within(Some(1_300), 1_000, window),
+            "at the window edge"
+        );
+        assert!(
+            !expires_within(Some(1_301), 1_000, window),
+            "outside the window"
+        );
+    }
+
+    #[test]
+    fn token_refresh_window_is_five_minutes_or_three_heartbeats() {
+        assert_eq!(
+            token_refresh_window(Duration::from_secs(30)),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            token_refresh_window(Duration::from_secs(120)),
+            Duration::from_secs(360)
+        );
+    }
+
+    #[test]
+    fn credential_rejection_is_unauthenticated_or_a_named_permission_denied() {
+        let rejected = |s: tonic::Status| is_credential_rejection(&anyhow::Error::from(s));
+
+        // The CP auth interceptor's verdict on a stale token.
+        assert!(rejected(tonic::Status::unauthenticated(
+            "instance-token: ExpiredSignature"
+        )));
+        assert!(rejected(tonic::Status::unauthenticated(
+            "missing instance-token"
+        )));
+        // PermissionDenied counts only when it names the instance token.
+        assert!(rejected(tonic::Status::permission_denied(
+            "Instance-Token revoked for this instance"
+        )));
+        assert!(rejected(tonic::Status::permission_denied(
+            "instance token no longer accepted"
+        )));
+        assert!(!rejected(tonic::Status::permission_denied(
+            "peer cert SPIFFE URI spiffe://a does not match JWT identity spiffe://b"
+        )));
+        // Transport and server trouble is retried with the same creds.
+        assert!(!rejected(tonic::Status::unavailable("connection reset")));
+        assert!(!rejected(tonic::Status::internal("db down")));
+        assert!(!rejected(tonic::Status::cancelled("stream closed")));
+
+        // A Status wrapped in context is still found; a plain error is not.
+        let wrapped = anyhow::Error::from(tonic::Status::unauthenticated("instance-token: x"))
+            .context("opening Channel");
+        assert!(is_credential_rejection(&wrapped));
+        assert!(!is_credential_rejection(&anyhow::anyhow!(
+            "no instance JWT cached; call register() first"
+        )));
+    }
+
+    /// A stand-in CP: Register hands out a fresh token; Channel accepts only
+    /// that token and refuses every other one the way the real auth
+    /// interceptor does. Records which tokens Channel was tried with.
+    mod fake_cp {
+        use std::pin::Pin;
+        use std::sync::{Arc, Mutex};
+
+        use mcpg_control_plane_core::proto::agent_control_server::{
+            AgentControl, AgentControlServer,
+        };
+        use mcpg_control_plane_core::proto::{
+            AgentMessage, DeregisterRequest, DeregisterResponse, HeartbeatRequest,
+            HeartbeatResponse, PullConfigRequest, PullConfigResponse, RegisterRequest,
+            RegisterResponse, ServerMessage,
+        };
+        use tonic::{Request, Response, Status, Streaming};
+
+        #[derive(Default)]
+        struct Inner {
+            channel_tokens: Mutex<Vec<String>>,
+            registers: Mutex<u32>,
+            /// Keeps every accepted Channel's outbound stream open.
+            senders: Mutex<Vec<tokio::sync::mpsc::Sender<Result<ServerMessage, Status>>>>,
+        }
+
+        /// Cheap to clone: the server owns one handle, the test keeps another.
+        #[derive(Clone)]
+        pub struct FakeCp {
+            /// The token Register issues — JWT-shaped with a far-off `exp`,
+            /// so the client's own expiry check accepts it.
+            fresh_jwt: String,
+            inner: Arc<Inner>,
+        }
+
+        impl FakeCp {
+            pub fn new() -> Self {
+                let exp = chrono::Utc::now().timestamp() + 3600;
+                Self {
+                    fresh_jwt: super::jwt_with_payload(&format!(r#"{{"exp":{exp}}}"#)),
+                    inner: Arc::default(),
+                }
+            }
+
+            pub fn fresh_jwt(&self) -> &str {
+                &self.fresh_jwt
+            }
+
+            /// Every token a Channel open presented, in order.
+            pub fn channel_tokens(&self) -> Vec<String> {
+                self.inner.channel_tokens.lock().unwrap().clone()
+            }
+
+            pub fn registers(&self) -> u32 {
+                *self.inner.registers.lock().unwrap()
+            }
+        }
+
+        #[tonic::async_trait]
+        impl AgentControl for FakeCp {
+            async fn register(
+                &self,
+                _request: Request<RegisterRequest>,
+            ) -> Result<Response<RegisterResponse>, Status> {
+                *self.inner.registers.lock().unwrap() += 1;
+                Ok(Response::new(RegisterResponse {
+                    instance_jwt: self.fresh_jwt.clone(),
+                    instance_id: "11111111-1111-7111-8111-111111111111".into(),
+                    cp_endpoint: "http://fake".into(),
+                    ..Default::default()
+                }))
+            }
+
+            type ChannelStream =
+                Pin<Box<dyn futures::Stream<Item = Result<ServerMessage, Status>> + Send>>;
+
+            async fn channel(
+                &self,
+                request: Request<Streaming<AgentMessage>>,
+            ) -> Result<Response<Self::ChannelStream>, Status> {
+                let token = request
+                    .metadata()
+                    .get("mcpg-instance-token")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                self.inner
+                    .channel_tokens
+                    .lock()
+                    .unwrap()
+                    .push(token.clone());
+                if token != self.fresh_jwt {
+                    return Err(Status::unauthenticated("instance-token: ExpiredSignature"));
+                }
+                let (tx, rx) = tokio::sync::mpsc::channel(4);
+                self.inner.senders.lock().unwrap().push(tx);
+                Ok(Response::new(Box::pin(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                )))
+            }
+
+            async fn pull_config(
+                &self,
+                _request: Request<PullConfigRequest>,
+            ) -> Result<Response<PullConfigResponse>, Status> {
+                Err(Status::unimplemented("fake"))
+            }
+
+            async fn heartbeat(
+                &self,
+                _request: Request<HeartbeatRequest>,
+            ) -> Result<Response<HeartbeatResponse>, Status> {
+                Err(Status::unimplemented("fake"))
+            }
+
+            async fn deregister(
+                &self,
+                _request: Request<DeregisterRequest>,
+            ) -> Result<Response<DeregisterResponse>, Status> {
+                Err(Status::unimplemented("fake"))
+            }
+        }
+
+        /// Serve the fake on a loopback port; returns the endpoint URL.
+        pub async fn serve(cp: FakeCp) -> String {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let incoming =
+                tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+            tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(AgentControlServer::new(cp))
+                    .serve_with_incoming(incoming),
+            );
+            format!("http://127.0.0.1:{port}")
+        }
+    }
+
+    /// Cached creds for `state_dir` carrying `jwt`, as a previous run would
+    /// have left them.
+    fn write_cached_creds(state_dir: &std::path::Path, jwt: &str) {
+        std::fs::create_dir_all(state_dir).unwrap();
+        let creds = StoredCreds {
+            instance_id: "cached-instance".into(),
+            instance_jwt: jwt.into(),
+            cp_endpoint: String::new(),
+            issued_at: chrono::Utc::now(),
+            client_cert_pem: String::new(),
+            client_key_pem: String::new(),
+            ca_chain_pem: String::new(),
+            payload_dek_b64: String::new(),
+            payload_dek_version: 0,
+        };
+        std::fs::write(
+            state_dir.join("agent-creds.json"),
+            serde_json::to_vec(&creds).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn runner_against(endpoint: String, state_dir: &std::path::Path) -> AgentRunner {
+        AgentRunner::new(AgentRunnerConfig {
+            cp_endpoint: endpoint,
+            enrollment_url: "http://fake/enroll/v1#token=ENROL-abc".into(),
+            instance_uid: "reenrol-test".into(),
+            state_dir: state_dir.to_path_buf(),
+            heartbeat_interval: Duration::from_millis(100),
+            backoff_initial: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(20),
+            ..AgentRunnerConfig::default()
+        })
+    }
+
+    /// Collect events until `until` matches one, or the deadline passes.
+    async fn events_until(
+        rx: &mut broadcast::Receiver<AgentEvent>,
+        until: impl Fn(&AgentEvent) -> bool,
+    ) -> Vec<AgentEvent> {
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while let Ok(Ok(ev)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            let done = until(&ev);
+            seen.push(ev);
+            if done {
+                break;
+            }
+        }
+        seen
+    }
+
+    /// A cached token the CP refuses is replaced through Register, not
+    /// retried forever: the runner re-enrols and the next Channel connects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_token_is_replaced_by_a_fresh_register() {
+        let cp = fake_cp::FakeCp::new();
+        let endpoint = fake_cp::serve(cp.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        // Well within its lifetime as far as the client can tell, so only the
+        // CP's verdict can trigger the re-enrol.
+        let far_future = chrono::Utc::now().timestamp() + 3600;
+        let stale = jwt_with_payload(&format!(r#"{{"sub":"stale","exp":{far_future}}}"#));
+        write_cached_creds(dir.path(), &stale);
+
+        let runner = runner_against(endpoint, dir.path());
+        let mut events = runner.subscribe();
+        let task = tokio::spawn(async move { runner.run().await });
+
+        let seen = events_until(&mut events, |e| matches!(e, AgentEvent::ChannelConnected)).await;
+        task.abort();
+
+        assert!(
+            seen.iter().any(|e| matches!(e, AgentEvent::ChannelDisconnected { reason } if reason.contains("Unauthenticated"))),
+            "the rejection is surfaced as a disconnect: {seen:?}"
+        );
+        let registered = seen
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Registered { .. }))
+            .expect("re-enrolled after the rejection");
+        let connected = seen
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ChannelConnected))
+            .expect("connected after re-enrolling");
+        assert!(registered < connected, "Register precedes the connect");
+
+        let tokens = cp.channel_tokens();
+        assert_eq!(tokens.first().map(String::as_str), Some(stale.as_str()));
+        assert_eq!(tokens.last().map(String::as_str), Some(cp.fresh_jwt()));
+        assert_eq!(cp.registers(), 1);
+        let on_disk = read_stored_creds(dir.path()).expect("creds rewritten");
+        assert_eq!(on_disk.instance_jwt, cp.fresh_jwt());
+    }
+
+    /// A cached token already past `exp` is never presented: the runner
+    /// re-enrols before its first connect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_cached_token_is_replaced_before_connecting() {
+        let cp = fake_cp::FakeCp::new();
+        let endpoint = fake_cp::serve(cp.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let past = chrono::Utc::now().timestamp() - 60;
+        write_cached_creds(
+            dir.path(),
+            &jwt_with_payload(&format!(r#"{{"exp":{past}}}"#)),
+        );
+
+        let runner = runner_against(endpoint, dir.path());
+        let mut events = runner.subscribe();
+        let task = tokio::spawn(async move { runner.run().await });
+
+        let seen = events_until(&mut events, |e| matches!(e, AgentEvent::ChannelConnected)).await;
+        task.abort();
+
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, AgentEvent::ChannelConnected)),
+            "connected: {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChannelDisconnected { .. })),
+            "no session was attempted with the expired token: {seen:?}"
+        );
+        assert_eq!(
+            cp.channel_tokens(),
+            [cp.fresh_jwt().to_owned()],
+            "only the fresh token ever reached Channel"
         );
     }
 }
