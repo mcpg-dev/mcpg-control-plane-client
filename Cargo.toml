@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-control-plane-client"
-version = "0.1.0-beta.33"
+version = "0.1.0-beta.39"
 edition = "2024"
 license = "Apache-2.0"
 description = "MCPG control-plane client library: connects a gateway to a Control Plane. Library, not a registered MCPG plugin — consumed by `apps/gateway` (feature-gated) and `apps/control-plane/{ctl,server}` directly."
@@ -9,7 +9,7 @@ description = "MCPG control-plane client library: connects a gateway to a Contro
 crate-type = ["lib"]
 
 [dependencies]
-mcpg-control-plane-core = { git = "https://github.com/mcpg-dev/mcpg-control-plane-core", tag = "v0.1.0-beta.33", version = "=0.1.0-beta.33" }
+mcpg-control-plane-core = { git = "https://github.com/mcpg-dev/mcpg-control-plane-core", tag = "v0.1.0-beta.39", version = "=0.1.0-beta.39" }
 
 # Async + errors
 tokio = { version = "1", features = ["full"] }
@@ -24,9 +24,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # gRPC client (calls into CP)
-tonic = { version = "0.12", features = ["transport", "tls"] }
-prost = "0.13"
-prost-types = "0.13"
+tonic = { version = "0.14", features = ["transport", "tls-aws-lc"] }
+prost = "0.14"
+prost-types = "0.14"
 tokio-stream = "0.1"
 
 # Time + IDs
@@ -35,15 +35,15 @@ uuid = { version = "1", features = ["serde", "v4", "v7"] }
 humantime = "2"
 
 # Random + jitter for backoff
-rand = "0.8"
+rand = "0.10"
 
 # LKG cache base64 encoding
-base64 = "0.22"
+base64 = "0.23"
 
 # LKG cache at-rest encryption (AES-256-GCM, machine-id-derived key)
-aes-gcm = "0.10"
-hkdf = "0.12"
-sha2 = "0.10"
+aes-gcm = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
 
 # Metrics buffer — short-critical-section locks. parking_lot's
 # Mutex is significantly faster than std for the high-frequency

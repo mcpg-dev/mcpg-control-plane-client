@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 
 #[derive(Clone, Debug)]
 pub struct Backoff {
@@ -28,7 +28,7 @@ impl Backoff {
         let raw = self.initial.saturating_mul(1u32 << exp);
         let bounded = raw.min(self.max);
         let with_jitter = if self.jitter {
-            let factor: f64 = rand::thread_rng().gen_range(0.75..=1.25);
+            let factor: f64 = rand::rng().random_range(0.75..=1.25);
             Duration::from_secs_f64(bounded.as_secs_f64() * factor)
         } else {
             bounded

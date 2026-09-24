@@ -401,7 +401,7 @@ impl AgentRunner {
                         "agent: CP rejected the instance credentials; re-enrolling"
                     );
                     let _ = self.events.send(AgentEvent::ChannelDisconnected {
-                        reason: e.to_string(),
+                        reason: describe_session_error(&e),
                     });
                     self.client.reset().await;
                     // The rejected creds are discarded only once something can
@@ -423,7 +423,7 @@ impl AgentRunner {
                     let delay = backoff.next_delay();
                     warn!(error = ?e, ?delay, "agent: session error, reconnecting");
                     let _ = self.events.send(AgentEvent::ChannelDisconnected {
-                        reason: e.to_string(),
+                        reason: describe_session_error(&e),
                     });
                     self.client.reset().await;
                     tokio::time::sleep(delay).await;
@@ -899,6 +899,19 @@ fn expires_within(exp: Option<i64>, now: i64, window: Duration) -> bool {
 /// is a `tonic::Status` anywhere in the chain with code `Unauthenticated`
 /// (the auth interceptor's verdict on the `mcpg-instance-token` header), or
 /// `PermissionDenied` whose message names the instance token.
+/// The disconnect reason an operator sees: a gRPC status names its code
+/// (`Unauthenticated: …`) rather than relying on tonic's own rendering of
+/// it; any other error prints as it is.
+fn describe_session_error(err: &anyhow::Error) -> String {
+    match err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+    {
+        Some(status) => format!("{:?}: {}", status.code(), status.message()),
+        None => err.to_string(),
+    }
+}
+
 fn is_credential_rejection(err: &anyhow::Error) -> bool {
     let Some(status) = err
         .chain()
@@ -1372,7 +1385,7 @@ mod tests {
                 .unwrap();
             let port = listener.local_addr().unwrap().port();
             let incoming =
-                tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+                tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
             tokio::spawn(
                 tonic::transport::Server::builder()
                     .add_service(AgentControlServer::new(cp))

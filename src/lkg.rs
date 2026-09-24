@@ -36,7 +36,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use hkdf::Hkdf;
 use mcpg_control_plane_core::proto::ConfigBundle;
 use prost::Message;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tracing::warn;
@@ -140,7 +140,7 @@ fn derive_key(state_dir: &Path) -> anyhow::Result<Key<Aes256Gcm>> {
     let mut okm = [0u8; 32];
     hk.expand(HKDF_INFO, &mut okm)
         .map_err(|e| anyhow::anyhow!("hkdf expand: {e}"))?;
-    Ok(*Key::<Aes256Gcm>::from_slice(&okm))
+    Ok(Key::<Aes256Gcm>::from(okm))
 }
 
 fn node_secret(state_dir: &Path) -> anyhow::Result<Vec<u8>> {
@@ -161,7 +161,9 @@ fn node_secret(state_dir: &Path) -> anyhow::Result<Vec<u8>> {
     }
     std::fs::create_dir_all(state_dir)?;
     let mut bytes = [0u8; NODE_SECRET_LEN];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS randomness unavailable");
     std::fs::write(&p, bytes)?;
     #[cfg(unix)]
     {
@@ -175,10 +177,12 @@ fn encrypt(plaintext: &[u8], state_dir: &Path) -> anyhow::Result<Vec<u8>> {
     let key = derive_key(state_dir)?;
     let cipher = Aes256Gcm::new(&key);
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    SysRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .expect("OS randomness unavailable");
+    let nonce = Nonce::from(nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| anyhow::anyhow!("aes-gcm encrypt: {e}"))?;
     let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
     out.push(FILE_VERSION);
@@ -195,15 +199,14 @@ fn decrypt(sealed: &[u8], state_dir: &Path) -> anyhow::Result<Vec<u8>> {
     if ver != FILE_VERSION {
         anyhow::bail!("unsupported LKG file version: {ver}");
     }
-    if sealed.len() < 1 + NONCE_LEN {
+    let Some((nonce_bytes, ct)) = sealed[1..].split_first_chunk::<NONCE_LEN>() else {
         anyhow::bail!("LKG file truncated");
-    }
-    let nonce = Nonce::from_slice(&sealed[1..1 + NONCE_LEN]);
-    let ct = &sealed[1 + NONCE_LEN..];
+    };
+    let nonce = Nonce::from(*nonce_bytes);
     let key = derive_key(state_dir)?;
     let cipher = Aes256Gcm::new(&key);
     cipher
-        .decrypt(nonce, ct)
+        .decrypt(&nonce, ct)
         .map_err(|e| anyhow::anyhow!("aes-gcm decrypt (corrupt or wrong key): {e}"))
 }
 

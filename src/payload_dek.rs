@@ -28,7 +28,7 @@
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use rand::RngCore;
+use rand::{TryRng, rngs::SysRng};
 
 /// AAD domain separator. Bumped only when the framing changes.
 const AAD: &[u8] = b"mcpg-payload-source-v1";
@@ -82,11 +82,13 @@ impl DekHandle {
         let cipher =
             Aes256Gcm::new_from_slice(&self.raw).map_err(|e| DekError::Encrypt(e.to_string()))?;
         let mut nonce_bytes = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        SysRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .expect("OS randomness unavailable");
+        let nonce = Nonce::from(nonce_bytes);
         let ct = cipher
             .encrypt(
-                nonce,
+                &nonce,
                 aes_gcm::aead::Payload {
                     msg: plaintext,
                     aad: AAD,
@@ -104,20 +106,14 @@ impl DekHandle {
     /// AAD; this helper exists so unit tests can round-trip.
     #[doc(hidden)]
     pub fn decrypt_for_test(&self, blob: &[u8]) -> Result<Vec<u8>, DekError> {
-        if blob.len() < 12 {
+        let Some((nonce_bytes, ct)) = blob.split_first_chunk::<12>() else {
             return Err(DekError::Encrypt("blob shorter than nonce".into()));
-        }
+        };
         let cipher =
             Aes256Gcm::new_from_slice(&self.raw).map_err(|e| DekError::Encrypt(e.to_string()))?;
-        let nonce = Nonce::from_slice(&blob[..12]);
+        let nonce = Nonce::from(*nonce_bytes);
         cipher
-            .decrypt(
-                nonce,
-                aes_gcm::aead::Payload {
-                    msg: &blob[12..],
-                    aad: AAD,
-                },
-            )
+            .decrypt(&nonce, aes_gcm::aead::Payload { msg: ct, aad: AAD })
             .map_err(|e| DekError::Encrypt(e.to_string()))
     }
 }
@@ -191,11 +187,12 @@ mod tests {
         let blob = dek.encrypt(pt).unwrap();
         // Manually decrypt with a different AAD — must fail.
         let cipher = Aes256Gcm::new_from_slice(&dek.raw).unwrap();
-        let nonce = Nonce::from_slice(&blob[..12]);
+        let (nonce_bytes, ct) = blob.split_first_chunk::<12>().unwrap();
+        let nonce = Nonce::from(*nonce_bytes);
         let bad = cipher.decrypt(
-            nonce,
+            &nonce,
             aes_gcm::aead::Payload {
-                msg: &blob[12..],
+                msg: ct,
                 aad: b"different-context",
             },
         );
