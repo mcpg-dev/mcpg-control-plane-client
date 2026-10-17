@@ -11,7 +11,9 @@
 use std::time::Duration;
 
 use mcpg_control_plane_core::proto::agent_message::Kind as AgentKind;
-use mcpg_control_plane_core::proto::{AgentMessage, ClusterStatus, PluginStatus, StatusReport};
+use mcpg_control_plane_core::proto::{
+    AgentMessage, ClusterStatus, DeliveryRefusal, PluginStatus, StatusReport,
+};
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -46,6 +48,16 @@ pub struct ClusterStatusSample {
     pub peers: Option<u32>,
 }
 
+/// Why the host counts the cloud licence of its last delivery for nothing.
+/// Never the licence itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryRefusalSample {
+    /// `no_proof` or `proof_refused`.
+    pub reason: String,
+    /// The `kid` the refused proof's header names; empty for `no_proof`.
+    pub proof_kid: String,
+}
+
 /// Host snapshot for one report. `config_hash` is stamped by the
 /// agent (it tracks the last-applied bundle hash), not the host.
 #[derive(Clone, Debug, Default)]
@@ -56,6 +68,9 @@ pub struct StatusSnapshot {
     /// Digest of the `${secret.*}` values the running config resolved with
     /// (sha256 over sorted `NAME=VALUE\n`, hex); empty when none.
     pub secrets_digest: String,
+    /// Set while the last licence delivery carries a cloud licence the host
+    /// counts for nothing, for want of a proof that verifies.
+    pub delivery_refusal: Option<DeliveryRefusalSample>,
 }
 
 /// Host hook that snapshots the running process for the periodic
@@ -95,6 +110,10 @@ pub(crate) fn snapshot_to_message(snap: StatusSnapshot, config_hash: String) -> 
                 peers: c.peers,
             }),
             secrets_digest: snap.secrets_digest,
+            delivery_refusal: snap.delivery_refusal.map(|r| DeliveryRefusal {
+                reason: r.reason,
+                proof_kid: r.proof_kid,
+            }),
         })),
     }
 }
@@ -143,6 +162,7 @@ mod tests {
                 peers: Some(3),
             }),
             secrets_digest: String::new(),
+            delivery_refusal: None,
         };
         let msg = snapshot_to_message(snap, "hash-1".into());
         let Some(AgentKind::StatusReport(r)) = msg.kind else {
@@ -167,6 +187,7 @@ mod tests {
                 peers: None,
             }),
             secrets_digest: String::new(),
+            delivery_refusal: None,
         };
         let msg = snapshot_to_message(snap, String::new());
         let Some(AgentKind::StatusReport(r)) = msg.kind else {
@@ -176,5 +197,29 @@ mod tests {
         assert_eq!(c.kind, "single_node");
         assert_eq!(c.backend_up, None);
         assert_eq!(c.peers, None);
+        assert_eq!(r.delivery_refusal, None);
+    }
+
+    /// A refused delivery goes on the wire as its reason and the proof's
+    /// `kid`, nothing more.
+    #[test]
+    fn a_refused_delivery_rides_on_the_report() {
+        let snap = StatusSnapshot {
+            delivery_refusal: Some(DeliveryRefusalSample {
+                reason: "proof_refused".into(),
+                proof_kid: "kid-1".into(),
+            }),
+            ..Default::default()
+        };
+        let Some(AgentKind::StatusReport(r)) = snapshot_to_message(snap, String::new()).kind else {
+            panic!("expected StatusReport");
+        };
+        assert_eq!(
+            r.delivery_refusal,
+            Some(DeliveryRefusal {
+                reason: "proof_refused".into(),
+                proof_kid: "kid-1".into(),
+            })
+        );
     }
 }

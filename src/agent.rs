@@ -200,11 +200,18 @@ pub struct AgentRunner {
     /// `StatusReport`. `None` → no reports (legacy behaviour for
     /// non-gateway agents). See [`crate::status::StatusSource`].
     status_source: Option<Arc<dyn crate::status::StatusSource>>,
+    /// Host hook for the org licence the CP delivers. `None` → the delivery
+    /// is only kept on disk. See [`crate::license_delivery`].
+    license_applier: Option<Arc<dyn crate::license_delivery::LicenseApplier>>,
     /// Hash of the last config bundle this process runs — the LKG
     /// preload at boot, then every successfully-applied ConfigUpdate.
     /// Stamped as `config_hash` on each `StatusReport` so the CP sees
     /// what is actually in effect, not what it last pushed.
     applied_config_hash: Arc<ArcSwap<Option<String>>>,
+    /// Drawn once per process and sent on every Channel it opens, so the CP
+    /// tells this process's Channels from those of the instance's other
+    /// pods.
+    process_id: String,
 }
 
 impl AgentRunner {
@@ -212,6 +219,7 @@ impl AgentRunner {
         let client = AgentClient::new(cfg.cp_endpoint.clone());
         let (events, _) = broadcast::channel(64);
         Self {
+            process_id: mcpg_control_plane_core::delivery::new_nonce(),
             cfg,
             client,
             events,
@@ -225,6 +233,7 @@ impl AgentRunner {
             payload_dek: Arc::new(ArcSwap::from_pointee(None)),
             config_applier: None,
             status_source: None,
+            license_applier: None,
             applied_config_hash: Arc::new(ArcSwap::from_pointee(None)),
         }
     }
@@ -242,6 +251,15 @@ impl AgentRunner {
     /// console's gateway pages). Without it the agent sends none.
     pub fn with_status_source(mut self, source: Arc<dyn crate::status::StatusSource>) -> Self {
         self.status_source = Some(source);
+        self
+    }
+
+    /// Wire a host hook that receives the org licence the CP delivers.
+    pub fn with_license_applier(
+        mut self,
+        applier: Arc<dyn crate::license_delivery::LicenseApplier>,
+    ) -> Self {
+        self.license_applier = Some(applier);
         self
     }
 
@@ -419,15 +437,34 @@ impl AgentRunner {
                     tokio::time::sleep(delay).await;
                     self.register_fresh().await?;
                 }
-                Err(e) => {
-                    let delay = backoff.next_delay();
-                    warn!(error = ?e, ?delay, "agent: session error, reconnecting");
-                    let _ = self.events.send(AgentEvent::ChannelDisconnected {
-                        reason: describe_session_error(&e),
-                    });
-                    self.client.reset().await;
-                    tokio::time::sleep(delay).await;
-                }
+                Err(e) => match slot_retry_in(&e) {
+                    // Retried when the slot frees rather than on the backoff,
+                    // which could sleep past it: a booting gateway waits on
+                    // this Channel for its licence.
+                    Some(retry_in) => {
+                        warn!(
+                            ?retry_in,
+                            "agent: another Channel of this instance holds its slot; trying again \
+                             once the control plane frees it"
+                        );
+                        let _ = self.events.send(AgentEvent::ChannelDisconnected {
+                            reason: describe_session_error(&e),
+                        });
+                        if let Some(applier) = self.license_applier.as_ref() {
+                            applier.channel_slot_held(retry_in).await;
+                        }
+                        tokio::time::sleep(retry_in).await;
+                    }
+                    None => {
+                        let delay = backoff.next_delay();
+                        warn!(error = ?e, ?delay, "agent: session error, reconnecting");
+                        let _ = self.events.send(AgentEvent::ChannelDisconnected {
+                            reason: describe_session_error(&e),
+                        });
+                        self.client.reset().await;
+                        tokio::time::sleep(delay).await;
+                    }
+                },
             }
         }
     }
@@ -439,8 +476,29 @@ impl AgentRunner {
         let (out_tx, out_rx) = mpsc::channel::<AgentMessage>(64);
         let outbound = tokio_stream::wrappers::ReceiverStream::new(out_rx);
 
+        // A fresh nonce per Channel: a delivery proof that names it shows
+        // the delivery came down this Channel and no other.
+        let nonce = mcpg_control_plane_core::delivery::new_nonce();
+        let mut request = tonic::Request::new(outbound);
+        insert_channel_metadata(
+            request.metadata_mut(),
+            &ChannelMetadata {
+                nonce: &nonce,
+                version: &self.cfg.version,
+                process: &self.process_id,
+                heartbeat: self.cfg.heartbeat_interval,
+            },
+        );
         let mut client = self.client.authed_client().await?;
-        let resp = client.channel(outbound).await?;
+        // The instance this Channel is authenticated as, which every delivery
+        // proof on it names: the uid in the instance token the CP issued.
+        let instance_uid = self
+            .client
+            .current_jwt()
+            .await
+            .and_then(|jwt| jwt_instance_uid(&jwt))
+            .unwrap_or_default();
+        let resp = client.channel(request).await?;
         let mut server_stream = resp.into_inner();
 
         info!("agent: Channel established");
@@ -479,10 +537,10 @@ impl AgentRunner {
         });
 
         // Tool-metrics flush ticker. Runs alongside the heartbeat
-        // ticker; each tick drains up to `DEFAULT_BATCH_CAP`
-        // samples + the dropped-overflow counter and ships them
-        // as a `MetricsReport`. Stops when the outbound channel
-        // closes (Channel reconnect / shutdown).
+        // ticker; each tick ships the whole buffer + the dropped
+        // counters as `MetricsReport`s of up to `DEFAULT_BATCH_CAP`
+        // samples. Stops when the outbound channel closes (Channel
+        // reconnect / shutdown).
         let metrics_buf = self.metrics.clone();
         let metrics_tx = out_tx.clone();
         let metrics_handle = tokio::spawn(async move {
@@ -519,7 +577,7 @@ impl AgentRunner {
         // Read inbound ServerMessages until the stream ends or shutdown is
         // asked for.
         let inbound_result = tokio::select! {
-            r = self.read_inbound(&mut server_stream, out_tx.clone()) => r,
+            r = self.read_inbound(&mut server_stream, out_tx.clone(), &nonce, &instance_uid) => r,
             _ = self.shutdown.notified() => Ok(()),
         };
 
@@ -546,13 +604,13 @@ impl AgentRunner {
         // Each drain is capped at one batch, so loop — bounded, because a
         // shutdown must not block on a buffer something else is still filling.
         for _ in 0..MAX_SHUTDOWN_FLUSH_BATCHES {
-            let (samples, dropped, seq) = self.metrics.drain();
-            let empty = samples.is_empty() && dropped == 0;
-            if let Some(msg) = crate::metrics::batch_to_message(&samples, dropped, seq)
+            let batch = self.metrics.drain();
+            let empty = batch.is_empty();
+            if let Some(msg) = crate::metrics::batch_to_message(&batch)
                 && out_tx.send(msg).await.is_err()
             {
                 warn!(
-                    samples = samples.len(),
+                    samples = batch.samples.len(),
                     "agent: outbound closed during shutdown flush; metrics not shipped"
                 );
                 return;
@@ -580,6 +638,8 @@ impl AgentRunner {
         &self,
         stream: &mut tonic::Streaming<ServerMessage>,
         out_tx: mpsc::Sender<AgentMessage>,
+        channel_nonce: &str,
+        instance_uid: &str,
     ) -> anyhow::Result<()> {
         while let Some(msg) = stream.next().await {
             let msg = msg?;
@@ -715,6 +775,31 @@ impl AgentRunner {
                         "agent: QuotaStatus push received"
                     );
                     self.quota_status.store(Arc::new(Some(qs)));
+                }
+                Some(ServerKind::LicenseUpdate(update)) => {
+                    let delivery = crate::license_delivery::LicenseDelivery {
+                        license_jwt: update.license_jwt,
+                        org_slug: update.org_slug,
+                        refresh_failing: update.refresh_failing,
+                        delivery_proof: update.delivery_proof,
+                        channel_nonce: channel_nonce.to_owned(),
+                        instance_uid: instance_uid.to_owned(),
+                    };
+                    info!(
+                        org = %delivery.org_slug,
+                        licensed = !delivery.license_jwt.is_empty(),
+                        with_proof = !delivery.delivery_proof.is_empty(),
+                        refresh_failing = delivery.refresh_failing,
+                        "agent: licence delivered"
+                    );
+                    if let Err(e) =
+                        crate::license_delivery::save_cached(&self.cfg.state_dir, &delivery)
+                    {
+                        warn!(error = ?e, "agent: keeping the delivered licence on disk failed");
+                    }
+                    if let Some(applier) = self.license_applier.as_ref() {
+                        applier.apply_license(&delivery).await;
+                    }
                 }
                 None => {}
             }
@@ -875,13 +960,24 @@ fn token_refresh_window(heartbeat_interval: Duration) -> Duration {
 /// The `exp` claim of a JWT, read from the payload without checking the
 /// signature — the CP verifies; this only decides whether to bother it.
 fn jwt_exp(jwt: &str) -> Option<i64> {
+    let exp = jwt_claims(jwt)?.get("exp")?.clone();
+    exp.as_i64().or_else(|| exp.as_f64().map(|f| f as i64))
+}
+
+/// The `instance_uid` claim of the CP-issued instance token.
+fn jwt_instance_uid(jwt: &str) -> Option<String> {
+    let claims = jwt_claims(jwt)?;
+    let uid = claims.get("instance_uid")?.as_str()?.trim();
+    (!uid.is_empty()).then(|| uid.to_owned())
+}
+
+/// The payload of `jwt`, unverified: the agent reads its own credential.
+fn jwt_claims(jwt: &str) -> Option<serde_json::Value> {
     let payload = jwt.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
         .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let exp = claims.get("exp")?;
-    exp.as_i64().or_else(|| exp.as_f64().map(|f| f as i64))
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Whether a token with this `exp` must be replaced before use. An
@@ -910,6 +1006,36 @@ fn describe_session_error(err: &anyhow::Error) -> String {
         Some(status) => format!("{:?}: {}", status.code(), status.message()),
         None => err.to_string(),
     }
+}
+
+/// The longest a refused Channel waits for its instance's slot: the longest
+/// a control plane lets a silent Channel hold it (two missed heartbeats of
+/// the longest interval a gateway runs, plus slack).
+const MAX_SLOT_RETRY: Duration = Duration::from_secs(125);
+
+/// Past the time the CP names, so the retry lands after the slot frees.
+const SLOT_RETRY_MARGIN: Duration = Duration::from_millis(250);
+
+/// When to open the Channel again after the CP refused it because another
+/// Channel of the instance holds its slot (`AlreadyExists`): just after the
+/// time the CP says the slot frees, or after the longest it can take when it
+/// names none. `None` for any other error.
+fn slot_retry_in(err: &anyhow::Error) -> Option<Duration> {
+    let status = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())?;
+    if status.code() != tonic::Code::AlreadyExists {
+        return None;
+    }
+    let named = status
+        .metadata()
+        .get(mcpg_control_plane_core::delivery::CHANNEL_RETRY_AFTER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis);
+    Some(named.map_or(MAX_SLOT_RETRY, |frees_in| {
+        (frees_in + SLOT_RETRY_MARGIN).min(MAX_SLOT_RETRY)
+    }))
 }
 
 fn is_credential_rejection(err: &anyhow::Error) -> bool {
@@ -1021,6 +1147,40 @@ fn hostname() -> Option<String> {
         .or_else(|| std::env::var("COMPUTERNAME").ok())
 }
 
+/// What a Channel opens with.
+struct ChannelMetadata<'a> {
+    /// This Channel's delivery nonce.
+    nonce: &'a str,
+    /// The running build's version. The CP keeps the version it registered
+    /// with until told otherwise, and a binary upgraded in place keeps its
+    /// credentials and never registers again.
+    version: &'a str,
+    /// This process's id.
+    process: &'a str,
+    /// How often the Channel heartbeats; the CP closes it after two missed.
+    heartbeat: Duration,
+}
+
+fn insert_channel_metadata(metadata: &mut tonic::metadata::MetadataMap, open: &ChannelMetadata) {
+    use mcpg_control_plane_core::delivery::{
+        AGENT_HEARTBEAT_HEADER, AGENT_PROCESS_HEADER, AGENT_VERSION_HEADER, DELIVERY_NONCE_HEADER,
+    };
+    let heartbeat_ms = open.heartbeat.as_millis().to_string();
+    for (key, value) in [
+        (DELIVERY_NONCE_HEADER, open.nonce),
+        (AGENT_VERSION_HEADER, open.version),
+        (AGENT_PROCESS_HEADER, open.process),
+        (AGENT_HEARTBEAT_HEADER, heartbeat_ms.as_str()),
+    ] {
+        match tonic::metadata::MetadataValue::try_from(value) {
+            Ok(value) => {
+                metadata.insert(key, value);
+            }
+            Err(_) => warn!(key, "agent: Channel metadata value is not ASCII; not sent"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,7 +1220,7 @@ mod tests {
         };
         assert_eq!(report.invocations.len(), 3);
         assert!(
-            metrics.drain().0.is_empty(),
+            metrics.drain().samples.is_empty(),
             "the buffer is emptied, not copied"
         );
     }
@@ -1191,6 +1351,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_instance_uid_comes_from_the_instance_token() {
+        assert_eq!(
+            jwt_instance_uid(&jwt_with_payload(r#"{"instance_uid":"gw-1","exp":1}"#)).as_deref(),
+            Some("gw-1")
+        );
+        assert_eq!(jwt_instance_uid(&jwt_with_payload(r#"{"exp":1}"#)), None);
+        assert_eq!(
+            jwt_instance_uid(&jwt_with_payload(r#"{"instance_uid":" "}"#)),
+            None
+        );
+        assert_eq!(jwt_instance_uid("not-a-jwt"), None);
+    }
+
     /// Whatever cannot be read is treated as "refresh now" — the loop never
     /// builds a session on a token it cannot vouch for.
     #[test]
@@ -1273,12 +1447,28 @@ mod tests {
         };
         use tonic::{Request, Response, Status, Streaming};
 
+        /// The metadata one Channel opened with.
+        #[derive(Clone, Debug)]
+        pub struct Opened {
+            pub nonce: String,
+            pub version: String,
+            pub process: String,
+            pub heartbeat_ms: String,
+            pub at: std::time::Instant,
+        }
+
         #[derive(Default)]
         struct Inner {
             channel_tokens: Mutex<Vec<String>>,
+            channel_metadata: Mutex<Vec<Opened>>,
             registers: Mutex<u32>,
+            /// Sent first on every accepted Channel, as the CP does.
+            license: Mutex<Option<mcpg_control_plane_core::proto::LicenseUpdate>>,
             /// Keeps every accepted Channel's outbound stream open.
             senders: Mutex<Vec<tokio::sync::mpsc::Sender<Result<ServerMessage, Status>>>>,
+            /// Channel opens still to refuse as a held slot, and the
+            /// milliseconds the refusal says the slot frees in.
+            hold_slot: Mutex<(u32, u64)>,
         }
 
         /// Cheap to clone: the server owns one handle, the test keeps another.
@@ -1294,7 +1484,9 @@ mod tests {
             pub fn new() -> Self {
                 let exp = chrono::Utc::now().timestamp() + 3600;
                 Self {
-                    fresh_jwt: super::jwt_with_payload(&format!(r#"{{"exp":{exp}}}"#)),
+                    fresh_jwt: super::jwt_with_payload(&format!(
+                        r#"{{"exp":{exp},"instance_uid":"fake-instance"}}"#
+                    )),
                     inner: Arc::default(),
                 }
             }
@@ -1310,6 +1502,28 @@ mod tests {
 
             pub fn registers(&self) -> u32 {
                 *self.inner.registers.lock().unwrap()
+            }
+
+            pub fn deliver_license(&self, license_jwt: &str, org_slug: &str) {
+                *self.inner.license.lock().unwrap() =
+                    Some(mcpg_control_plane_core::proto::LicenseUpdate {
+                        license_jwt: license_jwt.into(),
+                        org_slug: org_slug.into(),
+                        delivery_proof: "p.r.f".into(),
+                        refresh_failing: true,
+                    });
+            }
+
+            /// The metadata of every Channel open, in order.
+            pub fn channel_metadata(&self) -> Vec<Opened> {
+                self.inner.channel_metadata.lock().unwrap().clone()
+            }
+
+            /// Refuse the next `opens` Channel opens as the CP refuses one
+            /// whose instance's live Channel holds the slot, which frees in
+            /// `frees_in_ms`.
+            pub fn hold_slot(&self, opens: u32, frees_in_ms: u64) {
+                *self.inner.hold_slot.lock().unwrap() = (opens, frees_in_ms);
             }
         }
 
@@ -1335,12 +1549,26 @@ mod tests {
                 &self,
                 request: Request<Streaming<AgentMessage>>,
             ) -> Result<Response<Self::ChannelStream>, Status> {
-                let token = request
-                    .metadata()
-                    .get("mcpg-instance-token")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default()
-                    .to_owned();
+                let header = |key: &str| {
+                    request
+                        .metadata()
+                        .get(key)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                use mcpg_control_plane_core::delivery::{
+                    AGENT_HEARTBEAT_HEADER, AGENT_PROCESS_HEADER, AGENT_VERSION_HEADER,
+                    CHANNEL_RETRY_AFTER_HEADER, DELIVERY_NONCE_HEADER,
+                };
+                let token = header("mcpg-instance-token");
+                self.inner.channel_metadata.lock().unwrap().push(Opened {
+                    nonce: header(DELIVERY_NONCE_HEADER),
+                    version: header(AGENT_VERSION_HEADER),
+                    process: header(AGENT_PROCESS_HEADER),
+                    heartbeat_ms: header(AGENT_HEARTBEAT_HEADER),
+                    at: std::time::Instant::now(),
+                });
                 self.inner
                     .channel_tokens
                     .lock()
@@ -1349,7 +1577,25 @@ mod tests {
                 if token != self.fresh_jwt {
                     return Err(Status::unauthenticated("instance-token: ExpiredSignature"));
                 }
+                {
+                    let mut hold = self.inner.hold_slot.lock().unwrap();
+                    if hold.0 > 0 {
+                        hold.0 -= 1;
+                        let mut status = Status::already_exists("the slot is held");
+                        status.metadata_mut().insert(
+                            CHANNEL_RETRY_AFTER_HEADER,
+                            tonic::metadata::MetadataValue::from(hold.1),
+                        );
+                        return Err(status);
+                    }
+                }
                 let (tx, rx) = tokio::sync::mpsc::channel(4);
+                if let Some(update) = self.inner.license.lock().unwrap().clone() {
+                    use mcpg_control_plane_core::proto::server_message::Kind;
+                    let _ = tx.try_send(Ok(ServerMessage {
+                        kind: Some(Kind::LicenseUpdate(update)),
+                    }));
+                }
                 self.inner.senders.lock().unwrap().push(tx);
                 Ok(Response::new(Box::pin(
                     tokio_stream::wrappers::ReceiverStream::new(rx),
@@ -1487,6 +1733,158 @@ mod tests {
         assert_eq!(cp.registers(), 1);
         let on_disk = read_stored_creds(dir.path()).expect("creds rewritten");
         assert_eq!(on_disk.instance_jwt, cp.fresh_jwt());
+    }
+
+    /// The licence the CP delivers when the Channel opens reaches the host's
+    /// hook and is kept on disk for a restart while the CP is unreachable,
+    /// with its proof, the Channel's nonce and the instance the Channel is
+    /// authenticated as, so the restart can check the proof again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delivered_licence_reaches_the_host_and_the_disk() {
+        use crate::license_delivery::{LicenseApplier, LicenseDelivery, load_cached};
+
+        struct Recorder(tokio::sync::mpsc::UnboundedSender<LicenseDelivery>);
+        #[async_trait::async_trait]
+        impl LicenseApplier for Recorder {
+            async fn apply_license(&self, delivery: &LicenseDelivery) {
+                let _ = self.0.send(delivery.clone());
+            }
+        }
+
+        let cp = fake_cp::FakeCp::new();
+        cp.deliver_license("h.p.s", "acme");
+        let endpoint = fake_cp::serve(cp.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner =
+            runner_against(endpoint, dir.path()).with_license_applier(Arc::new(Recorder(tx)));
+        let task = tokio::spawn(async move { runner.run().await });
+
+        let delivered = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("delivered before the deadline")
+            .expect("the hook saw it");
+        task.abort();
+
+        let nonce = cp
+            .channel_metadata()
+            .last()
+            .map(|opened| opened.nonce.clone())
+            .expect("a Channel opened");
+        let expected = LicenseDelivery {
+            license_jwt: "h.p.s".into(),
+            org_slug: "acme".into(),
+            refresh_failing: true,
+            delivery_proof: "p.r.f".into(),
+            channel_nonce: nonce,
+            instance_uid: "fake-instance".into(),
+        };
+        assert_eq!(delivered, expected);
+        assert_eq!(load_cached(dir.path()), Some(expected));
+    }
+
+    /// Every Channel opens with a nonce of its own, which a delivery proof
+    /// must name, the version of the binary that runs, the id of the process,
+    /// the same on each of its Channels, and its heartbeat interval.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_channel_opens_with_a_fresh_nonce_and_the_running_version() {
+        let cp = fake_cp::FakeCp::new();
+        let endpoint = fake_cp::serve(cp.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let far_future = chrono::Utc::now().timestamp() + 3600;
+        let stale = jwt_with_payload(&format!(r#"{{"sub":"stale","exp":{far_future}}}"#));
+        write_cached_creds(dir.path(), &stale);
+
+        let mut runner = runner_against(endpoint, dir.path());
+        runner.cfg.version = "9.8.7-rc.6".into();
+        let mut events = runner.subscribe();
+        let task = tokio::spawn(async move { runner.run().await });
+        events_until(&mut events, |e| matches!(e, AgentEvent::ChannelConnected)).await;
+        task.abort();
+
+        let opened = cp.channel_metadata();
+        assert_eq!(
+            opened.len(),
+            2,
+            "the stale token's Channel, then the fresh one"
+        );
+        for o in &opened {
+            assert_eq!(o.nonce.len(), 43, "32 random bytes, base64url: {}", o.nonce);
+            assert_eq!(o.version, "9.8.7-rc.6");
+            assert_eq!(o.process.len(), 43, "drawn like a nonce: {}", o.process);
+            assert_eq!(o.heartbeat_ms, "100");
+        }
+        assert_ne!(
+            opened[0].nonce, opened[1].nonce,
+            "a reconnect sends a new nonce"
+        );
+        assert_eq!(
+            opened[0].process, opened[1].process,
+            "a reconnect is the same process"
+        );
+        let other = runner_against("http://127.0.0.1:1".into(), dir.path());
+        let first = runner_against("http://127.0.0.1:1".into(), dir.path());
+        assert_ne!(
+            other.process_id, first.process_id,
+            "each process draws its own"
+        );
+    }
+
+    /// A Channel the CP refuses because another Channel of the instance holds
+    /// its slot opens again just after the time the CP names for the slot to
+    /// free, not after the reconnect backoff, and the host hears how long
+    /// that is: a booting gateway waits on this Channel for its licence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_channel_refused_for_a_held_slot_opens_again_when_the_slot_frees() {
+        use crate::license_delivery::{LicenseApplier, LicenseDelivery};
+
+        struct Recorder(tokio::sync::mpsc::UnboundedSender<Duration>);
+        #[async_trait::async_trait]
+        impl LicenseApplier for Recorder {
+            async fn apply_license(&self, _delivery: &LicenseDelivery) {}
+            async fn channel_slot_held(&self, retry_in: Duration) {
+                let _ = self.0.send(retry_in);
+            }
+        }
+
+        let cp = fake_cp::FakeCp::new();
+        cp.hold_slot(1, 300);
+        let endpoint = fake_cp::serve(cp.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        write_cached_creds(dir.path(), cp.fresh_jwt());
+        let (tx, mut held) = tokio::sync::mpsc::unbounded_channel();
+        let mut runner =
+            runner_against(endpoint, dir.path()).with_license_applier(Arc::new(Recorder(tx)));
+        // A backoff this long would leave the gateway waiting past its boot.
+        runner.cfg.backoff_initial = Duration::from_secs(30);
+        runner.cfg.backoff_max = Duration::from_secs(60);
+        let mut events = runner.subscribe();
+        let task = tokio::spawn(async move { runner.run().await });
+
+        let retry_in = tokio::time::timeout(Duration::from_secs(10), held.recv())
+            .await
+            .expect("the host hears of the held slot")
+            .expect("the hook saw it");
+        assert_eq!(retry_in, Duration::from_millis(550));
+        let connected = tokio::time::timeout(
+            Duration::from_secs(5),
+            events_until(&mut events, |e| matches!(e, AgentEvent::ChannelConnected)),
+        )
+        .await
+        .expect("opened again well before the backoff");
+        task.abort();
+        assert!(
+            connected
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ChannelConnected)),
+            "{connected:?}"
+        );
+        let opened = cp.channel_metadata();
+        assert_eq!(opened.len(), 2, "the refused open, then the one that held");
+        assert!(
+            opened[1].at.duration_since(opened[0].at) >= Duration::from_millis(500),
+            "not before the slot frees"
+        );
     }
 
     /// A cached token already past `exp` is never presented: the runner

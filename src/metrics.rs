@@ -6,44 +6,53 @@
 //!   `Mutex<VecDeque>` (writes are short — pushing one sample —
 //!   so contention is minimal even under heavy load).
 //! - The plugin host calls `record(sample)` synchronously on
-//!   every tool dispatch. If the buffer is full, the oldest
-//!   sample is dropped and the `dropped_overflow` counter is
-//!   incremented; this is surfaced in the next MetricsReport so
-//!   the operator knows we lost data.
+//!   every tool dispatch. If the buffer is full, one sample is
+//!   dropped and counted: a non-billable one (policy-denied,
+//!   quota-refused, replayed) — the arriving one, or the oldest
+//!   buffered one — whenever there is one, else the oldest billable
+//!   one. The two counts ride the next MetricsReport as
+//!   `dropped_non_billable` and `dropped_overflow`.
 //!
 //!   DELIBERATE TRADEOFF: drop-with-counter, NOT back-pressure. The
 //!   recorder sits on the gateway's dispatch hot path — blocking it to
 //!   preserve a metrics sample would trade tenant-visible latency for
 //!   billing precision. The exact drop COUNT always survives (the
 //!   counter rides every report), so the CP knows precisely how many
-//!   billable samples were lost; folding that count into usage as a
-//!   billing adjustment is the usage-export job's concern
-//!   (BILLING.md P4). Overflow needs >~166 sustained calls/sec for the
-//!   full 30s flush window at the default 5k cap before any drop.
+//!   billable samples were lost and folds exactly that many into the
+//!   ledger; a dropped refusal is never billed. Each flush ships the
+//!   whole buffer, and a buffer four-fifths full flushes early (at
+//!   most once per `EARLY_FLUSH_SPACING`), so a drop needs the Channel
+//!   to be down or calls to outpace one full buffer per second — not a
+//!   sustained rate above cap / interval.
 //! - `flush_loop` is the async task spawned alongside the agent's
-//!   Channel session. It wakes every `MetricsBuffer.flush_interval`,
-//!   drains the buffer, builds a `MetricsReport`, and sends it
-//!   via the agent's outbound mpsc.
+//!   Channel session. It wakes every flush interval, or early when the
+//!   buffer fills, drains the buffer in `MetricsReport`s of up to
+//!   `batch_cap` samples, and sends them via the agent's outbound mpsc.
 //!
 //! Privacy invariant: tool *names* + aggregate stats only. Tool
 //! arguments and responses are NEVER captured here.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use mcpg_control_plane_core::proto::agent_message::Kind as AgentKind;
 use mcpg_control_plane_core::proto::{
-    AgentMessage, MetricsReport, ToolInvocationSample, ToolOutcome,
+    AgentMessage, EventUsageSample, MetricsReport, ToolInvocationSample, ToolOutcome,
 };
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-/// Default in-memory ring buffer size — at 5 calls/sec for 60s
-/// that's a 60-second buffer of headroom even under spikes.
+/// Default in-memory ring buffer size. A buffer four-fifths full ships
+/// early, so this bounds memory and a burst, not the sustained call rate.
 pub const DEFAULT_BUFFER_CAP: usize = 5_000;
+
+/// The shortest time between the starts of two flushes when the second is
+/// an early one. Bounds the report rate a runaway producer can cause at one
+/// full buffer per interval of this length.
+pub const EARLY_FLUSH_SPACING: Duration = Duration::from_secs(1);
 
 /// Default cap on samples-per-MetricsReport. Bounds wire size
 /// (~200B per sample × 500 = 100KB max) and per-tx insert cost
@@ -109,6 +118,16 @@ pub enum SampleOutcome {
 }
 
 impl SampleOutcome {
+    /// Whether a call with this outcome counts toward billing and quota:
+    /// the same set as the control plane's
+    /// `ToolOutcome::counts_toward_usage`.
+    pub fn is_billable(self) -> bool {
+        !matches!(
+            self,
+            Self::PolicyDenied | Self::QuotaExceeded | Self::IdempotentReplay
+        )
+    }
+
     fn to_proto(self) -> ToolOutcome {
         match self {
             Self::Ok => ToolOutcome::Ok,
@@ -129,11 +148,112 @@ pub struct MetricsBuffer {
 }
 
 struct Inner {
-    buf: Mutex<VecDeque<ToolCallSample>>,
+    buf: Mutex<Ring>,
     cap: usize,
     batch_cap: usize,
+    /// Buffered samples at which the flush loop is woken before its tick.
+    flush_early_at: usize,
+    /// Wakes the flush loop early. A wake sent while the loop is busy is
+    /// kept, so the loop flushes again as soon as it is done.
+    flush_early: tokio::sync::Notify,
+    /// Billable samples dropped since the last drain.
     dropped_overflow: AtomicU64,
+    /// Non-billable samples dropped since the last drain.
+    dropped_non_billable: AtomicU64,
     seq: AtomicU64,
+    /// MCP Events deliveries and ingests since the last drain.
+    events: Mutex<EventsRollup>,
+}
+
+/// MCP Events usage counted per (event type, mode) since `since`.
+#[derive(Default)]
+struct EventsRollup {
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    counts: BTreeMap<(String, String), EventCounts>,
+}
+
+/// What MCP Events delivered or took in of one type in one mode: a delivery
+/// mode for deliveries, a source kind for ingests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventCounts {
+    /// First deliveries acknowledged.
+    pub delivered: u64,
+    /// Events given up.
+    pub abandoned: u64,
+    /// Occurrences taken into the event log.
+    pub ingested: u64,
+    /// Bytes of the delivered bodies, or of the ingested occurrences.
+    pub bytes: u64,
+}
+
+impl EventCounts {
+    fn add(&mut self, other: EventCounts) {
+        self.delivered = self.delivered.saturating_add(other.delivered);
+        self.abandoned = self.abandoned.saturating_add(other.abandoned);
+        self.ingested = self.ingested.saturating_add(other.ingested);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+}
+
+/// One MCP Events rollup row of a report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventUsage {
+    pub event_name: String,
+    pub mode: String,
+    pub counts: EventCounts,
+    pub window_start: chrono::DateTime<chrono::Utc>,
+    pub window_end: chrono::DateTime<chrono::Utc>,
+}
+
+/// The buffered samples, and how many of them are non-billable so a full
+/// buffer knows without a scan whether it has one to give up.
+struct Ring {
+    samples: VecDeque<ToolCallSample>,
+    non_billable: usize,
+}
+
+impl Ring {
+    fn push_back(&mut self, sample: ToolCallSample) {
+        self.non_billable += usize::from(!sample.outcome.is_billable());
+        self.samples.push_back(sample);
+    }
+
+    fn push_front(&mut self, sample: ToolCallSample) {
+        self.non_billable += usize::from(!sample.outcome.is_billable());
+        self.samples.push_front(sample);
+    }
+
+    fn remove(&mut self, at: usize) -> Option<ToolCallSample> {
+        let sample = self.samples.remove(at)?;
+        self.non_billable = self
+            .non_billable
+            .saturating_sub(usize::from(!sample.outcome.is_billable()));
+        Some(sample)
+    }
+}
+
+/// Samples drained for one `MetricsReport`, with the drops counted since the
+/// previous drain.
+#[derive(Debug)]
+pub struct Drained {
+    pub samples: Vec<ToolCallSample>,
+    /// Billable samples dropped on overflow; the CP bills them.
+    pub dropped_overflow: u64,
+    /// Non-billable samples dropped on overflow; never billed.
+    pub dropped_non_billable: u64,
+    pub seq: u64,
+    /// MCP Events deliveries since the previous drain.
+    pub events: Vec<EventUsage>,
+}
+
+impl Drained {
+    /// Nothing to report: no samples, no drops and no event deliveries.
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+            && self.dropped_overflow == 0
+            && self.dropped_non_billable == 0
+            && self.events.is_empty()
+    }
 }
 
 impl MetricsBuffer {
@@ -144,61 +264,147 @@ impl MetricsBuffer {
     pub fn with_caps(cap: usize, batch_cap: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
-                buf: Mutex::new(VecDeque::with_capacity(cap)),
+                buf: Mutex::new(Ring {
+                    samples: VecDeque::with_capacity(cap),
+                    non_billable: 0,
+                }),
                 cap,
                 batch_cap,
+                flush_early_at: (cap - cap / 5).max(1),
+                flush_early: tokio::sync::Notify::new(),
                 dropped_overflow: AtomicU64::new(0),
+                dropped_non_billable: AtomicU64::new(0),
                 seq: AtomicU64::new(0),
+                events: Mutex::new(EventsRollup::default()),
             }),
         }
     }
 
-    /// Record one sample. Drops the oldest entry when the buffer
-    /// is full (incrementing `dropped_overflow`). Synchronous +
-    /// fast — safe to call from any dispatch path.
-    pub fn record(&self, sample: ToolCallSample) {
-        let mut buf = self.inner.buf.lock();
-        if buf.len() >= self.inner.cap {
-            buf.pop_front();
-            self.inner.dropped_overflow.fetch_add(1, Ordering::Relaxed);
+    /// Count MCP Events usage of `event_name` in `mode` into the next
+    /// report. Synchronous and fast.
+    pub fn record_events(&self, event_name: &str, mode: &str, counts: EventCounts) {
+        if counts == EventCounts::default() {
+            return;
         }
-        buf.push_back(sample);
+        let mut events = self.inner.events.lock();
+        events.since.get_or_insert_with(chrono::Utc::now);
+        events
+            .counts
+            .entry((event_name.to_owned(), mode.to_owned()))
+            .or_default()
+            .add(counts);
     }
 
-    /// Drain up to `batch_cap` oldest samples and the current
-    /// `dropped_overflow` count. Resets the dropped counter so
-    /// each flush reports only what was dropped *since the last
-    /// flush*.
-    pub fn drain(&self) -> (Vec<ToolCallSample>, u64, u64) {
-        let mut buf = self.inner.buf.lock();
-        let n = buf.len().min(self.inner.batch_cap);
-        let drained: Vec<_> = buf.drain(..n).collect();
-        let dropped = self.inner.dropped_overflow.swap(0, Ordering::Relaxed);
-        let seq = self.inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        (drained, dropped, seq)
+    fn count_drop(&self, outcome: SampleOutcome) {
+        let counter = if outcome.is_billable() {
+            &self.inner.dropped_overflow
+        } else {
+            &self.inner.dropped_non_billable
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one sample. A full buffer drops an arriving non-billable
+    /// sample outright; an arriving billable one takes the place of the
+    /// oldest non-billable sample, or of the oldest billable one when there
+    /// is none. Every drop is counted by its billability. A buffer that
+    /// reaches four-fifths of its cap wakes the flush loop. Synchronous +
+    /// fast — safe to call from any dispatch path.
+    pub fn record(&self, sample: ToolCallSample) {
+        let mut ring = self.inner.buf.lock();
+        let buffered = ring.samples.len();
+        if buffered + 1 >= self.inner.flush_early_at {
+            self.inner.flush_early.notify_one();
+        }
+        if buffered >= self.inner.cap {
+            // A billable drop is billed from its count and a non-billable one
+            // never is, so the buffer spends non-billable samples first. A
+            // flood of refusals is dropped on arrival, without a scan.
+            if !sample.outcome.is_billable() {
+                self.count_drop(sample.outcome);
+                return;
+            }
+            let victim = if ring.non_billable > 0 {
+                ring.samples
+                    .iter()
+                    .position(|s| !s.outcome.is_billable())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if let Some(dropped) = ring.remove(victim) {
+                self.count_drop(dropped.outcome);
+            }
+        }
+        ring.push_back(sample);
+    }
+
+    /// Drain up to `batch_cap` oldest samples and the drops counted since
+    /// the previous drain, resetting both counters.
+    pub fn drain(&self) -> Drained {
+        let mut ring = self.inner.buf.lock();
+        let n = ring.samples.len().min(self.inner.batch_cap);
+        let samples: Vec<_> = ring.samples.drain(..n).collect();
+        let drained_non_billable = samples.iter().filter(|s| !s.outcome.is_billable()).count();
+        ring.non_billable = ring.non_billable.saturating_sub(drained_non_billable);
+        let rollup = std::mem::take(&mut *self.inner.events.lock());
+        let window_end = chrono::Utc::now();
+        let window_start = rollup.since.unwrap_or(window_end);
+        let events = rollup
+            .counts
+            .into_iter()
+            .map(|((event_name, mode), counts)| EventUsage {
+                event_name,
+                mode,
+                counts,
+                window_start,
+                window_end,
+            })
+            .collect();
+        Drained {
+            samples,
+            dropped_overflow: self.inner.dropped_overflow.swap(0, Ordering::Relaxed),
+            dropped_non_billable: self.inner.dropped_non_billable.swap(0, Ordering::Relaxed),
+            seq: self.inner.seq.fetch_add(1, Ordering::Relaxed) + 1,
+            events,
+        }
     }
 
     /// Put a drained batch back at the front of the buffer, oldest first, and
-    /// restore its dropped count. Samples that no longer fit are counted as
-    /// dropped rather than discarded quietly — the ledger stays neutral to
-    /// buffer overflow either way.
-    fn requeue_front(&self, samples: Vec<ToolCallSample>, dropped: u64) {
-        let total = samples.len();
-        let mut buf = self.inner.buf.lock();
-        let mut readmitted = 0;
+    /// restore its dropped counts. Samples that no longer fit are counted as
+    /// dropped, by billability, rather than discarded quietly — the ledger
+    /// stays neutral to buffer overflow either way.
+    fn requeue_front(&self, batch: Drained) {
+        let mut ring = self.inner.buf.lock();
         // Reverse, because each push_front puts its sample ahead of the last.
-        for sample in samples.into_iter().rev() {
-            if buf.len() >= self.inner.cap {
-                break;
+        for sample in batch.samples.into_iter().rev() {
+            if ring.samples.len() >= self.inner.cap {
+                self.count_drop(sample.outcome);
+            } else {
+                ring.push_front(sample);
             }
-            buf.push_front(sample);
-            readmitted += 1;
         }
-        // Whatever no longer fits is counted, not silently discarded.
-        let overflowed = total.saturating_sub(readmitted) as u64;
         self.inner
             .dropped_overflow
-            .fetch_add(dropped + overflowed, Ordering::Relaxed);
+            .fetch_add(batch.dropped_overflow, Ordering::Relaxed);
+        self.inner
+            .dropped_non_billable
+            .fetch_add(batch.dropped_non_billable, Ordering::Relaxed);
+        let mut events = self.inner.events.lock();
+        for usage in batch.events {
+            let since = events.since.get_or_insert(usage.window_start);
+            *since = (*since).min(usage.window_start);
+            events
+                .counts
+                .entry((usage.event_name, usage.mode))
+                .or_default()
+                .add(usage.counts);
+        }
+    }
+
+    /// Samples waiting for the next flush.
+    fn buffered(&self) -> usize {
+        self.inner.buf.lock().samples.len()
     }
 
     /// BLAKE3 hex hash of an error message — operators correlate
@@ -219,18 +425,22 @@ impl Default for MetricsBuffer {
 }
 
 /// Build a wire-shape `AgentMessage` from a drained batch.
+fn timestamp(at: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: at.timestamp(),
+        nanos: at.timestamp_subsec_nanos() as i32,
+    }
+}
+
 /// `None` when the batch is empty AND nothing was dropped (we
 /// don't want to spam the CP with empty reports — but we DO send
-/// when only `dropped > 0` so the operator sees it).
-pub fn batch_to_message(
-    samples: &[ToolCallSample],
-    dropped: u64,
-    seq: u64,
-) -> Option<AgentMessage> {
-    if samples.is_empty() && dropped == 0 {
+/// when only drops were counted so the operator sees them).
+pub fn batch_to_message(batch: &Drained) -> Option<AgentMessage> {
+    if batch.is_empty() {
         return None;
     }
-    let invocations: Vec<ToolInvocationSample> = samples
+    let invocations: Vec<ToolInvocationSample> = batch
+        .samples
         .iter()
         .map(|s| ToolInvocationSample {
             plugin_id: s.plugin_id.clone(),
@@ -266,9 +476,24 @@ pub fn batch_to_message(
                 seconds: chrono::Utc::now().timestamp(),
                 nanos: 0,
             }),
-            seq,
+            seq: batch.seq,
             invocations,
-            dropped_overflow: dropped,
+            dropped_overflow: batch.dropped_overflow,
+            dropped_non_billable: batch.dropped_non_billable,
+            events: batch
+                .events
+                .iter()
+                .map(|usage| EventUsageSample {
+                    event_name: usage.event_name.clone(),
+                    mode: usage.mode.clone(),
+                    delivered: usage.counts.delivered,
+                    abandoned: usage.counts.abandoned,
+                    ingested: usage.counts.ingested,
+                    bytes: usage.counts.bytes,
+                    window_start: Some(timestamp(usage.window_start)),
+                    window_end: Some(timestamp(usage.window_end)),
+                })
+                .collect(),
         })),
     })
 }
@@ -279,75 +504,101 @@ pub fn batch_to_message(
 /// same problem: a send that fails, and a task aborted while awaiting one.
 struct InFlight<'a> {
     buffer: &'a MetricsBuffer,
-    samples: Vec<ToolCallSample>,
-    dropped: u64,
+    batch: Option<Drained>,
 }
 
 impl InFlight<'_> {
     /// The batch is on its way; stop tracking it.
     fn disarm(&mut self) {
-        self.samples = Vec::new();
-        self.dropped = 0;
+        self.batch = None;
     }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        if self.samples.is_empty() && self.dropped == 0 {
+        let Some(batch) = self.batch.take().filter(|b| !b.is_empty()) else {
             return;
-        }
+        };
         warn!(
-            samples = self.samples.len(),
-            dropped = self.dropped,
+            samples = batch.samples.len(),
+            dropped = batch.dropped_overflow,
+            dropped_non_billable = batch.dropped_non_billable,
             "metrics flush: batch undelivered; returning it to the buffer"
         );
-        self.buffer
-            .requeue_front(std::mem::take(&mut self.samples), self.dropped);
+        self.buffer.requeue_front(batch);
     }
 }
 
-/// Background loop: every `interval`, drain the buffer + ship
-/// the result over `out_tx`. Stops when `out_tx` is closed
-/// (Channel reconnecting).
+/// Background loop: every `interval`, and early when the buffer is
+/// four-fifths full, ship the whole buffer over `out_tx` in reports of up to
+/// `batch_cap` samples. Stops when `out_tx` is closed (Channel reconnecting).
 pub async fn flush_loop(
     buffer: MetricsBuffer,
     out_tx: mpsc::Sender<AgentMessage>,
     interval: Duration,
 ) {
+    // A full buffer is this many batches. The bound keeps a producer that
+    // outpaces the channel from holding one tick open forever; what it
+    // leaves behind ships on the next tick.
+    let batches_per_tick = buffer
+        .inner
+        .cap
+        .div_ceil(buffer.inner.batch_cap.max(1))
+        .max(1);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // immediate
-    loop {
-        let (drained, dropped, seq) = buffer.drain();
-        let count = drained.len();
-        // The batch is out of the buffer and lives only in this local. The
-        // task is aborted on every Channel reconnect, and an abort drops the
-        // future — and with it the batch — at the `send` below. The guard
-        // hands it back instead, so a reconnect costs no billable calls.
-        let mut inflight = InFlight {
-            buffer: &buffer,
-            samples: drained,
-            dropped,
-        };
-        if let Some(msg) = batch_to_message(&inflight.samples, dropped, seq) {
-            if out_tx.send(msg).await.is_err() {
-                // Nothing was queued, so the batch is still owed. Leave the
-                // guard armed to return it and let the next session ship it.
-                debug!("metrics flush: outbound channel closed; stopping");
+    'session: loop {
+        let started = tokio::time::Instant::now();
+        for _ in 0..batches_per_tick {
+            let batch = buffer.drain();
+            let count = batch.samples.len();
+            let (dropped, dropped_non_billable, seq) = (
+                batch.dropped_overflow,
+                batch.dropped_non_billable,
+                batch.seq,
+            );
+            // The batch is out of the buffer and lives only in this local. The
+            // task is aborted on every Channel reconnect, and an abort drops
+            // the future — and with it the batch — at the `send` below. The
+            // guard hands it back instead, so a reconnect costs no billable
+            // calls.
+            let mut inflight = InFlight {
+                buffer: &buffer,
+                batch: Some(batch),
+            };
+            let msg = inflight.batch.as_ref().and_then(batch_to_message);
+            if let Some(msg) = msg {
+                if out_tx.send(msg).await.is_err() {
+                    // Nothing was queued, so the batch is still owed. Leave
+                    // the guard armed to return it and let the next session
+                    // ship it.
+                    debug!("metrics flush: outbound channel closed; stopping");
+                    break 'session;
+                }
+                debug!(
+                    count,
+                    dropped, dropped_non_billable, seq, "metrics flush: shipped batch"
+                );
+            }
+            inflight.disarm();
+            if count < buffer.inner.batch_cap {
                 break;
             }
-            debug!(count, dropped, seq, "metrics flush: shipped batch");
         }
-        inflight.disarm();
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            () = buffer.inner.flush_early.notified() => {
+                tokio::time::sleep_until(started + EARLY_FLUSH_SPACING).await;
+            }
+        }
     }
-    if buffer.inner.buf.lock().is_empty() {
-        debug!("metrics flush: buffer empty at shutdown");
-    } else {
-        warn!(
-            buffered = buffer.inner.buf.lock().len(),
+    match buffer.buffered() {
+        0 => debug!("metrics flush: buffer empty at shutdown"),
+        buffered => warn!(
+            buffered,
             "metrics flush: shutdown with samples still in buffer"
-        );
+        ),
     }
 }
 
@@ -385,13 +636,309 @@ mod tests {
                 Duration::from_millis(10 + i),
             ));
         }
-        let (drained, dropped, seq) = b.drain();
+        let batch = b.drain();
+        let drained = &batch.samples;
         assert_eq!(drained.len(), 3);
-        assert_eq!(dropped, 0);
-        assert_eq!(seq, 1);
+        assert_eq!(batch.dropped_overflow, 0);
+        assert_eq!(batch.seq, 1);
         // FIFO order preserved.
         assert_eq!(drained[0].duration, Duration::from_millis(10));
         assert_eq!(drained[2].duration, Duration::from_millis(12));
+    }
+
+    fn batch(samples: Vec<ToolCallSample>, dropped_overflow: u64) -> Drained {
+        Drained {
+            samples,
+            dropped_overflow,
+            dropped_non_billable: 0,
+            seq: 1,
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn event_deliveries_roll_up_per_type_and_reach_the_report() {
+        let buf = MetricsBuffer::with_caps(10, 10);
+        let counts = |delivered, bytes| EventCounts {
+            delivered,
+            bytes,
+            ..EventCounts::default()
+        };
+        buf.record_events("orders.created", "webhook", counts(2, 200));
+        buf.record_events("orders.created", "webhook", counts(1, 50));
+        buf.record_events("invoices.paid", "webhook", EventCounts::default());
+        buf.record_events(
+            "orders.created",
+            "inbound",
+            EventCounts {
+                ingested: 4,
+                bytes: 40,
+                ..EventCounts::default()
+            },
+        );
+        let drained = buf.drain();
+        assert!(!drained.is_empty(), "event usage alone is worth a report");
+        assert_eq!(drained.events.len(), 2, "a zero count adds no row");
+        let webhook = drained
+            .events
+            .iter()
+            .find(|usage| usage.mode == "webhook")
+            .unwrap();
+        assert_eq!(webhook.counts, counts(3, 250));
+        let Some(AgentMessage {
+            kind: Some(AgentKind::MetricsReport(report)),
+        }) = batch_to_message(&drained)
+        else {
+            panic!("a metrics report");
+        };
+        let webhook = report.events.iter().find(|e| e.mode == "webhook").unwrap();
+        assert_eq!(webhook.event_name, "orders.created");
+        assert_eq!(webhook.delivered, 3);
+        let inbound = report.events.iter().find(|e| e.mode == "inbound").unwrap();
+        assert_eq!((inbound.ingested, inbound.delivered), (4, 0));
+        assert!(buf.drain().events.is_empty(), "drained once");
+
+        // A report that could not be sent comes back, counts and window.
+        buf.record_events("orders.created", "webhook", counts(1, 10));
+        let batch = buf.drain();
+        buf.requeue_front(batch);
+        buf.record_events("orders.created", "webhook", counts(1, 10));
+        assert_eq!(buf.drain().events[0].counts, counts(2, 20));
+    }
+
+    fn outcomes(samples: &[ToolCallSample]) -> Vec<SampleOutcome> {
+        samples.iter().map(|s| s.outcome).collect()
+    }
+
+    /// A dropped billable sample is billed through its count; a dropped
+    /// refusal must not be. A buffer flooded with refusals — an exhausted
+    /// tenant's client retrying — counts none of them as billable drops.
+    #[test]
+    fn overflow_of_refusals_counts_no_billable_drop() {
+        let b = MetricsBuffer::with_caps(3, 10);
+        for _ in 0..5 {
+            b.record(sample(
+                "p",
+                "t",
+                SampleOutcome::QuotaExceeded,
+                Duration::from_millis(1),
+            ));
+        }
+        let batch = b.drain();
+        assert_eq!(batch.samples.len(), 3);
+        assert_eq!(batch.dropped_overflow, 0, "no billable call was lost");
+        assert_eq!(batch.dropped_non_billable, 2);
+    }
+
+    /// A full buffer gives up its non-billable samples before any billable
+    /// one, and a refusal arriving at a buffer of billable samples is the one
+    /// dropped.
+    #[test]
+    fn a_full_buffer_drops_non_billable_samples_first() {
+        let b = MetricsBuffer::with_caps(3, 10);
+        let rec = |outcome| b.record(sample("p", "t", outcome, Duration::from_millis(1)));
+        rec(SampleOutcome::Ok);
+        rec(SampleOutcome::PolicyDenied);
+        rec(SampleOutcome::ServerError);
+        // Full: the policy denial goes, not the older billable call.
+        rec(SampleOutcome::Ok);
+        // Full of billable calls: an arriving replay is itself dropped.
+        rec(SampleOutcome::IdempotentReplay);
+        let batch = b.drain();
+        assert_eq!(
+            outcomes(&batch.samples),
+            [
+                SampleOutcome::Ok,
+                SampleOutcome::ServerError,
+                SampleOutcome::Ok
+            ]
+        );
+        assert_eq!(batch.dropped_overflow, 0);
+        assert_eq!(batch.dropped_non_billable, 2);
+
+        // Only billable samples left to give: the oldest one goes, and counts.
+        rec(SampleOutcome::Ok);
+        rec(SampleOutcome::ServerError);
+        rec(SampleOutcome::QuotaExceeded);
+        rec(SampleOutcome::ClientError);
+        let batch = b.drain();
+        assert_eq!(
+            outcomes(&batch.samples),
+            [
+                SampleOutcome::Ok,
+                SampleOutcome::ServerError,
+                SampleOutcome::ClientError
+            ]
+        );
+        assert_eq!(batch.dropped_overflow, 0);
+        assert_eq!(batch.dropped_non_billable, 1);
+        for outcome in [
+            SampleOutcome::Ok,
+            SampleOutcome::Ok,
+            SampleOutcome::Ok,
+            SampleOutcome::ClientError,
+        ] {
+            rec(outcome);
+        }
+        let batch = b.drain();
+        assert_eq!(
+            batch.dropped_overflow, 1,
+            "the oldest billable call is counted"
+        );
+        assert_eq!(batch.dropped_non_billable, 0);
+    }
+
+    /// Billable exactly when the control plane counts the outcome toward
+    /// usage: everything but policy denials, quota refusals and replays.
+    #[test]
+    fn billable_outcomes_are_the_ones_that_ran() {
+        use SampleOutcome::*;
+        for (outcome, billable) in [
+            (Ok, true),
+            (ClientError, true),
+            (ServerError, true),
+            (PolicyDenied, false),
+            (QuotaExceeded, false),
+            (IdempotentReplay, false),
+        ] {
+            assert_eq!(outcome.is_billable(), billable, "{outcome:?}");
+        }
+    }
+
+    /// One tick ships the whole buffer, a report per `batch_cap` samples, so
+    /// the sustained rate before any drop is cap / interval rather than
+    /// batch_cap / interval.
+    #[tokio::test]
+    async fn one_flush_tick_ships_the_whole_buffer() {
+        let buffer = MetricsBuffer::with_caps(5_000, 500);
+        for i in 0..1_234 {
+            buffer.record(sample(
+                "p",
+                &format!("t{i}"),
+                SampleOutcome::Ok,
+                Duration::from_millis(1),
+            ));
+        }
+        let (tx, mut rx) = mpsc::channel(64);
+        let handle = {
+            let buffer = buffer.clone();
+            tokio::spawn(async move { flush_loop(buffer, tx, Duration::from_secs(3_600)).await })
+        };
+        let mut sizes = Vec::new();
+        while sizes.iter().sum::<usize>() < 1_234 {
+            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the first tick ships the rest of the buffer")
+                .expect("flush loop running");
+            match msg.kind {
+                Some(AgentKind::MetricsReport(m)) => sizes.push(m.invocations.len()),
+                _ => panic!("expected MetricsReport"),
+            }
+        }
+        handle.abort();
+        assert_eq!(sizes, [500, 500, 234]);
+        assert_eq!(buffer.buffered(), 0);
+    }
+
+    /// A buffer past four-fifths of its cap ships long before its tick, so
+    /// bursts that add up to more than cap / interval lose no row.
+    #[tokio::test]
+    async fn a_filling_buffer_ships_before_its_tick() {
+        let buffer = MetricsBuffer::with_caps(100, 10);
+        let (tx, mut rx) = mpsc::channel(1_024);
+        let handle = {
+            let buffer = buffer.clone();
+            tokio::spawn(async move { flush_loop(buffer, tx, Duration::from_secs(3_600)).await })
+        };
+        let started = tokio::time::Instant::now();
+        let (mut shipped, mut dropped) = (0usize, 0u64);
+        for burst in 0..3 {
+            for i in 0..90 {
+                buffer.record(sample(
+                    "p",
+                    &format!("t{burst}-{i}"),
+                    SampleOutcome::Ok,
+                    Duration::from_millis(1),
+                ));
+            }
+            while shipped < (burst + 1) * 90 {
+                let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("a buffer past its high-water mark ships before its tick")
+                    .expect("flush loop running");
+                let Some(AgentKind::MetricsReport(report)) = msg.kind else {
+                    panic!("expected MetricsReport");
+                };
+                shipped += report.invocations.len();
+                dropped += report.dropped_overflow + report.dropped_non_billable;
+            }
+        }
+        handle.abort();
+        assert_eq!(shipped, 270);
+        assert_eq!(dropped, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Early flushes start at most once per `EARLY_FLUSH_SPACING`, however
+    /// fast the buffer refills.
+    #[tokio::test]
+    async fn early_flushes_are_spaced() {
+        let buffer = MetricsBuffer::with_caps(100, 100);
+        let (tx, mut rx) = mpsc::channel(1_024);
+        let handle = {
+            let buffer = buffer.clone();
+            tokio::spawn(async move { flush_loop(buffer, tx, Duration::from_secs(3_600)).await })
+        };
+        let mut arrivals = Vec::new();
+        for burst in 0..4 {
+            for i in 0..90 {
+                buffer.record(sample(
+                    "p",
+                    &format!("t{burst}-{i}"),
+                    SampleOutcome::Ok,
+                    Duration::from_millis(1),
+                ));
+            }
+            rx.recv().await.expect("flush loop running");
+            arrivals.push(tokio::time::Instant::now());
+        }
+        handle.abort();
+        // A round's report arrives a little after the round starts, and the
+        // spacing is measured between starts.
+        let slack = Duration::from_millis(100);
+        for pair in arrivals.windows(2) {
+            assert!(
+                pair[1] - pair[0] + slack >= EARLY_FLUSH_SPACING,
+                "{arrivals:?}"
+            );
+        }
+    }
+
+    /// A batch handed back after a failed send keeps its drop counts, and
+    /// the samples that no longer fit are counted by their billability.
+    #[test]
+    fn a_requeued_batch_counts_what_no_longer_fits_by_billability() {
+        let b = MetricsBuffer::with_caps(2, 10);
+        let mut back = batch(
+            vec![
+                sample("p", "a", SampleOutcome::PolicyDenied, Duration::ZERO),
+                sample("p", "b", SampleOutcome::Ok, Duration::ZERO),
+                sample("p", "c", SampleOutcome::Ok, Duration::ZERO),
+            ],
+            4,
+        );
+        back.dropped_non_billable = 5;
+        b.record(sample("p", "d", SampleOutcome::Ok, Duration::ZERO));
+        b.requeue_front(back);
+        let batch = b.drain();
+        let names: Vec<_> = batch.samples.iter().map(|s| s.tool_name.as_str()).collect();
+        assert_eq!(names, ["c", "d"]);
+        assert_eq!(batch.dropped_overflow, 4 + 1);
+        assert_eq!(batch.dropped_non_billable, 5 + 1);
     }
 
     #[test]
@@ -405,10 +952,12 @@ mod tests {
                 Duration::from_millis(10 + i),
             ));
         }
-        let (drained, dropped, _) = b.drain();
+        let batch = b.drain();
+        let drained = &batch.samples;
         // Oldest 2 dropped; 3 newest remain.
         assert_eq!(drained.len(), 3);
-        assert_eq!(dropped, 2);
+        assert_eq!(batch.dropped_overflow, 2);
+        assert_eq!(batch.dropped_non_billable, 0);
         assert_eq!(drained[0].duration, Duration::from_millis(12));
         assert_eq!(drained[2].duration, Duration::from_millis(14));
     }
@@ -424,7 +973,7 @@ mod tests {
                 Duration::from_millis(i),
             ));
         }
-        let (drained, _, _) = b.drain();
+        let drained = b.drain().samples;
         assert_eq!(drained.len(), 5);
         // Oldest 5; the rest stay buffered.
         assert_eq!(drained[0].duration, Duration::from_millis(0));
@@ -442,27 +991,35 @@ mod tests {
                 Duration::from_millis(i),
             ));
         }
-        let (_, dropped1, _) = b.drain();
-        assert_eq!(dropped1, 3);
-        let (_, dropped2, _) = b.drain();
-        assert_eq!(dropped2, 0);
+        assert_eq!(b.drain().dropped_overflow, 3);
+        assert_eq!(b.drain().dropped_overflow, 0);
     }
 
     #[test]
     fn batch_to_message_skips_empty_no_drops() {
-        let msg = batch_to_message(&[], 0, 1);
+        let msg = batch_to_message(&batch(vec![], 0));
         assert!(msg.is_none());
     }
 
     #[test]
     fn batch_to_message_emits_when_only_drops() {
-        let msg = batch_to_message(&[], 5, 1).unwrap();
+        let msg = batch_to_message(&batch(vec![], 5)).unwrap();
         match msg.kind {
             Some(AgentKind::MetricsReport(m)) => {
                 assert!(m.invocations.is_empty());
                 assert_eq!(m.dropped_overflow, 5);
+                assert_eq!(m.dropped_non_billable, 0);
             }
             _ => panic!("expected MetricsReport"),
+        }
+        let mut refusals = batch(vec![], 0);
+        refusals.dropped_non_billable = 7;
+        match batch_to_message(&refusals).map(|m| m.kind) {
+            Some(Some(AgentKind::MetricsReport(m))) => {
+                assert_eq!(m.dropped_overflow, 0);
+                assert_eq!(m.dropped_non_billable, 7);
+            }
+            _ => panic!("a report of non-billable drops alone is still sent"),
         }
     }
 
@@ -503,7 +1060,7 @@ mod tests {
         handle.abort();
         let _ = handle.await;
 
-        let (recovered, _, _) = buffer.drain();
+        let recovered = buffer.drain().samples;
         assert_eq!(
             recovered.len(),
             5,
@@ -528,7 +1085,7 @@ mod tests {
         drop(rx); // closed: every send fails
         flush_loop(buffer.clone(), tx, Duration::from_millis(5)).await;
 
-        let (recovered, _, _) = buffer.drain();
+        let recovered = buffer.drain().samples;
         assert_eq!(recovered.len(), 1, "a failed send loses nothing");
     }
 
@@ -543,7 +1100,7 @@ mod tests {
         s.request_payload = Some(b"ciphertext-blob".to_vec());
         s.payload_encrypted = true;
         s.dek_version = 7;
-        let msg = batch_to_message(&[s], 0, 1).unwrap();
+        let msg = batch_to_message(&batch(vec![s], 0)).unwrap();
         match msg.kind {
             Some(AgentKind::MetricsReport(m)) => {
                 assert_eq!(m.invocations.len(), 1);
@@ -568,7 +1125,7 @@ mod tests {
         );
         s.payload_encrypted = false;
         s.dek_version = 99;
-        let msg = batch_to_message(&[s], 0, 1).unwrap();
+        let msg = batch_to_message(&batch(vec![s], 0)).unwrap();
         match msg.kind {
             Some(AgentKind::MetricsReport(m)) => {
                 assert!(!m.invocations[0].payload_encrypted);
@@ -586,7 +1143,7 @@ mod tests {
             SampleOutcome::ServerError,
             Duration::from_millis(50),
         );
-        let msg = batch_to_message(&[s], 0, 1).unwrap();
+        let msg = batch_to_message(&batch(vec![s], 0)).unwrap();
         match msg.kind {
             Some(AgentKind::MetricsReport(m)) => {
                 assert_eq!(m.invocations.len(), 1);

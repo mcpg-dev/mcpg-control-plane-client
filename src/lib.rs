@@ -15,6 +15,7 @@ pub mod agent;
 pub mod backoff;
 pub mod client;
 pub mod config;
+pub mod license_delivery;
 pub mod lkg;
 pub mod logs;
 pub mod metrics;
@@ -24,11 +25,14 @@ pub mod status;
 pub use agent::{AgentEvent, AgentRunner, AgentRunnerConfig, AgentShutdown, ConfigApplier};
 pub use client::AgentClient;
 pub use config::ControlPlaneClientConfig;
+pub use license_delivery::{LicenseApplier, LicenseDelivery};
 pub use lkg::{LkgCache, LkgEntry};
 pub use logs::{LogBuffer, LogLevel, LogLineSample};
 pub use metrics::{MetricsBuffer, SampleOutcome, ToolCallSample};
 pub use payload_dek::{DekError, DekHandle};
-pub use status::{ClusterStatusSample, PluginStatusSample, StatusSnapshot, StatusSource};
+pub use status::{
+    ClusterStatusSample, DeliveryRefusalSample, PluginStatusSample, StatusSnapshot, StatusSource,
+};
 
 /// Re-exported so gateway / consumers can refer to the
 /// CP's QuotaStatus type without depending on
