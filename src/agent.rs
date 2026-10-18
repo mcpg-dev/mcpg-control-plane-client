@@ -51,6 +51,9 @@ pub struct AgentRunnerConfig {
     /// listener is TLS and the caller hasn't pre-populated a
     /// previous run's `agent-creds.json`.
     pub bootstrap_ca_pem: Option<String>,
+    /// How often the tool-metrics buffer ships; `None` is the default
+    /// `DEFAULT_FLUSH_INTERVAL` (30 s).
+    pub metrics_flush_interval: Option<Duration>,
 }
 
 impl Default for AgentRunnerConfig {
@@ -65,6 +68,7 @@ impl Default for AgentRunnerConfig {
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             bootstrap_ca_pem: None,
+            metrics_flush_interval: None,
         }
     }
 }
@@ -543,8 +547,12 @@ impl AgentRunner {
         // reconnect / shutdown).
         let metrics_buf = self.metrics.clone();
         let metrics_tx = out_tx.clone();
+        let metrics_interval = self
+            .cfg
+            .metrics_flush_interval
+            .unwrap_or(DEFAULT_FLUSH_INTERVAL);
         let metrics_handle = tokio::spawn(async move {
-            metrics_flush_loop(metrics_buf, metrics_tx, DEFAULT_FLUSH_INTERVAL).await;
+            metrics_flush_loop(metrics_buf, metrics_tx, metrics_interval).await;
         });
 
         // Log-batch flush ticker — same shape as metrics, on a staggered

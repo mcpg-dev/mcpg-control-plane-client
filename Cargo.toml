@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-control-plane-client"
-version = "0.1.0-beta.46"
+version = "0.1.0-beta.47"
 edition = "2024"
 license = "Apache-2.0"
 description = "MCPG control-plane client library: connects a gateway to a Control Plane. Library, not a registered MCPG plugin — consumed by `apps/gateway` (feature-gated) and `apps/control-plane/{ctl,server}` directly."
